@@ -18,7 +18,8 @@ frame=    1 fps=0.0 q=-0.0 Lsize=N/A
 class VideoMediaTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="test-video-")
-        self.root = Path(self.tmp.name)
+        # Compare canonical filesystem paths, not short-name spellings.
+        self.root = Path(self.tmp.name).resolve()
         runtime_patch = patch("unified_mcp.video_media.RUNTIME", self.root)
         runtime_patch.start()
         self.addCleanup(runtime_patch.stop)

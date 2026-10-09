@@ -29,7 +29,8 @@ class VoiceSetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="wxqq-setup-tests-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # Windows TEMP may contain an 8.3 alias; production paths are resolved.
+        self.root = Path(self.tmp.name).resolve()
         self.files = {"model.int8.onnx": b"synthetic model", "tokens.txt": b"synthetic tokens"}
         self.specs = {name: digest(data) for name, data in self.files.items()}
 

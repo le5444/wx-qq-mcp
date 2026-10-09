@@ -32,7 +32,8 @@ def v4(plain, key=b"cfcd208495d565ef", xor=87):
 class WeChatMediaTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="test-media-")
-        self.root = Path(self.tmp.name)
+        # Compare canonical filesystem paths, not short-name spellings.
+        self.root = Path(self.tmp.name).resolve()
         runtime_patch = patch("unified_mcp.wechat_media.RUNTIME", self.root)
         runtime_patch.start()
         self.addCleanup(runtime_patch.stop)
