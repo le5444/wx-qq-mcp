@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "wx-mcp": {
+      "type": "stdio",
+      "command": "C:/path/to/wx-qq-mcp/.venv/Scripts/python.exe",
+      "args": ["-m", "unified_mcp.server"],
+      "env": {
+        "UNIFIED_WECHAT_COMMAND": "C:/path/to/wx-mcp.exe",
+        "UNIFIED_WECHAT_ARGS": "[]",
+        "QQ_MCP_DB_ROOT": "C:/path/to/account/nt_qq/nt_db",
+        "QQ_MCP_EXTENSION": "C:/path/to/sqlite_ext_ntqq_db.dll"
+      }
+    }
+  }
+}

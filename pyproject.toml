@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wx-qq-mcp"
+version = "0.2.1"
+description = "Windows MCP gateway for local WeChat and QQ history, media and optional local speech recognition"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
+authors = [{name = "wx-qq-mcp contributors"}]
+keywords = ["mcp", "wechat", "qq", "local-first", "speech-recognition"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  "mcp==1.30.0",
+  "sqlcipher3-wheels==0.5.7; sys_platform == 'win32'",
+  "Pillow==12.2.0",
+  "cryptography==49.0.0",
+  "pycryptodome==3.23.0",
+]
+
+[project.scripts]
+wx-qq-mcp = "unified_mcp.server:main"
+wx-qq-reader = "unified_mcp.reader_export:main"
+
+[tool.setuptools]
+packages = ["unified_mcp"]
+py-modules = ["qq_mcp_server", "setup_qq_mcp_key"]
+
+[tool.setuptools.package-data]
+unified_mcp = ["*.json", "*.ps1", "*.html", "requirements*.txt"]

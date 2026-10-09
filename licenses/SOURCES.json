@@ -1,0 +1,33 @@
+{
+  "checked_at_utc": "2026-10-09T15:21:09.537529+00:00",
+  "scope": "Original notices only; corresponding external binaries and model weights are not included.",
+  "files": [
+    {
+      "file": "R266-Tech-MIT.txt",
+      "upstream": "https://github.com/r266-tech/wechat-local-mcp",
+      "source": "Retained upstream v1.5.4 release LICENSE",
+      "copyright": "Copyright (c) 2026 R266 Tech",
+      "sha256": "280c78448ddde629f36de774fadf3eee6dc23d363261f66c5afcea467e73836f",
+      "bytes": 1087,
+      "license": "MIT"
+    },
+    {
+      "file": "qq-nt-export-MIT.txt",
+      "upstream": "https://github.com/q957506633/qq-nt-export",
+      "source": "https://raw.githubusercontent.com/q957506633/qq-nt-export/main/LICENSE",
+      "copyright": "Copyright (c) 2026 qq-nt-export contributors",
+      "sha256": "e1a3defb1e2e9145ce83ef141d788a592ec8253ab62d6734809ea1194f0b4798",
+      "bytes": 1082,
+      "license": "MIT"
+    },
+    {
+      "file": "ntdb_unwrap-MIT.txt",
+      "upstream": "https://github.com/artiga033/ntdb_unwrap",
+      "source": "https://raw.githubusercontent.com/artiga033/ntdb_unwrap/main/LICENSE",
+      "copyright": "Copyright (c) 2025 artiga033",
+      "sha256": "6d6e97041e3d87b8c333d7751931a46a9edaf8fb8ea7295c78d6620395190abe",
+      "bytes": 1065,
+      "license": "MIT"
+    }
+  ]
+}

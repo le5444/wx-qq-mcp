@@ -1,0 +1,5 @@
+mcp==1.30.0
+sqlcipher3-wheels==0.5.7
+Pillow==12.2.0
+cryptography==49.0.0
+pycryptodome==3.23.0

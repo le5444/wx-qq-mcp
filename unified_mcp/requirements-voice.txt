@@ -1,0 +1,7 @@
+# Install into the dedicated LocalAppData/wx-mcp/voice-asr/venv, not gateway .venv.
+# PyAV 19 removes metadata_errors used by faster-whisper 1.2.1.
+faster-whisper==1.2.1
+av==18.1.0
+ctranslate2==4.8.2
+silk-python==0.2.8
+sherpa-onnx==1.13.8
