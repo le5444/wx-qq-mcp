@@ -15,14 +15,13 @@ from pathlib import Path
 from unified_mcp.batch_support import atomic_json as write_json, canonical, digest, file_fingerprint, open_store, output_lock, project_jsonl
 from unified_mcp.server import Gateway
 from unified_mcp.timeline import decoded_result, normal_message, start_bound, TZ
+from unified_mcp.record_identity import stable_raw, raw_fingerprint, extended_record_id
+from unified_mcp.read_contract import canonical_chat, page_source_complete, page_warnings, validate_record_chat
 
 
 def _stable_row(row):
-    # Paths, decoder verdicts and OCR are rebuildable convenience fields. A
-    # downloaded image must not look like an edit to the source message.
-    derived = {'images', 'cached_images', 'videos', 'image_text', 'voice_transcript',
-               'qq_media_resolution', 'wechat_media_resolution', 'wechat_video_resolution'}
-    return {key: value for key, value in row.items() if key not in derived}
+    # Kept as a compatibility import for older batch callers.
+    return stable_raw(row)
 
 
 def _page(page):
@@ -33,7 +32,19 @@ def _page(page):
         raise RuntimeError('Source omitted messages or terminal pagination metadata')
     if any(not isinstance(row, dict) or row.get('error') for row in rows):
         raise RuntimeError('Source returned an unreadable row')
+    if not page_source_complete(page):
+        raise RuntimeError('Source message coverage is incomplete; export cannot prove a complete history')
     return rows, query, digest({'rows': [_stable_row(row) for row in rows], 'has_more': query['has_more']})
+
+
+def _checked_chat(source, payload, requested, rows, expected=None, chat_type=None):
+    try:
+        resolved = canonical_chat(source, payload, requested, expected, chat_type=chat_type)
+        for row in rows:
+            validate_record_chat(source, row, resolved, chat_type=chat_type)
+        return resolved
+    except ValueError as exc:
+        raise RuntimeError('Source returned a different chat identity than the requested export scope') from exc
 
 
 def iter_jsonl(path):
@@ -148,7 +159,11 @@ async def _export_locked(options, output):
         gateway = Gateway()
         if resume:
             for source, number, args_json, expected in db.execute('SELECT source,number,args,digest FROM pages ORDER BY source,number'):
-                _, _, actual = _page(decoded_result(await gateway.fetch(source, 'chat_timeline', json.loads(args_json))))
+                payload = decoded_result(await gateway.fetch(source, 'chat_timeline', json.loads(args_json)))
+                page_rows, _, actual = _page(payload)
+                saved_source = _states(db)[source]
+                _checked_chat(source, payload, chats[source], page_rows, saved_source.get('canonical_chat_id'),
+                              scope['qq_chat_type'] if source == 'qq' else None)
                 if actual != expected:
                     raise ValueError(f'Source history changed at {source} page {number}; saved export preserved, start a new snapshot')
             report['resume_revalidated_pages'] = db.execute('SELECT COUNT(*) FROM pages').fetchone()[0]
@@ -160,6 +175,9 @@ async def _export_locked(options, output):
                 args = _args(source, chat, scope, state)
                 payload = decoded_result(await gateway.fetch(source, 'chat_timeline', args))
                 rows, query, page_hash = _page(payload)
+                resolved = _checked_chat(source, payload, chat, rows, state.get('canonical_chat_id'),
+                                         scope['qq_chat_type'] if source == 'qq' else None)
+                state['canonical_chat_id'] = resolved
                 next_offset, next_cursor = query.get('next_offset'), query.get('next_cursor')
                 if query['has_more']:
                     cursor_advances = isinstance(next_cursor, str) and bool(next_cursor) and next_cursor != state.get('cursor')
@@ -174,11 +192,7 @@ async def _export_locked(options, output):
                 previous_count = state['records']
                 with db:
                     for row in rows:
-                        native_identity = row.get('id') if isinstance(row.get('id'), dict) else {}
-                        native_chat = (row.get('talker') or native_identity.get('talker')) if source == 'wechat' else row.get('chat_id')
-                        if native_chat and str(native_chat) != str(chat):
-                            raise RuntimeError(f'{source} returned a record from a different chat')
-                        msg, identity = normal_message(source, row, chat), digest(_stable_row(row))
+                        msg, identity = normal_message(source, row, resolved), raw_fingerprint(row)
                         if not msg['message_id'] or not isinstance(msg['timestamp'], (int, float)):
                             raise RuntimeError(f'{source} returned a row without identity/time')
                         if msg['timestamp'] >= int(args['before']) or ('after' in args and msg['timestamp'] < int(args['after'])):
@@ -188,10 +202,29 @@ async def _export_locked(options, output):
                             continue
                         if state.get('last_timestamp') is not None and msg['timestamp'] < state['last_timestamp']:
                             raise RuntimeError(f'{source} page order moved backwards')
-                        if db.execute('SELECT 1 FROM records WHERE source=? AND message_id=?', (source, msg['message_id'])).fetchone():
+                        prior_native = db.execute('SELECT seq,payload FROM records WHERE source=? AND message_id=?',
+                                                  (source, msg['message_id'])).fetchall()
+                        if prior_native:
                             state['message_id_collisions'] += 1
-                        if db.execute('SELECT 1 FROM records WHERE source=? AND record_id=?', (source, msg['record_id'])).fetchone():
-                            msg['record_id'] += ':' + identity
+                        same_base = []
+                        for previous_seq, previous_payload in prior_native:
+                            previous = json.loads(previous_payload)
+                            if previous.get('base_record_id', previous['record_id']) == msg['record_id']:
+                                same_base.append((previous_seq, previous))
+                        if same_base:
+                            # Every conflicting source row receives a content
+                            # discriminator, including the first exported row.
+                            # Otherwise the first record remains ambiguous and
+                            # a third collision could reuse the bare ID.
+                            for previous_seq, previous in same_base:
+                                if previous.get('base_record_id'):
+                                    continue
+                                previous['base_record_id'] = previous['record_id']
+                                previous['record_id'] = extended_record_id(previous['record_id'], previous['original'])
+                                db.execute('UPDATE records SET record_id=?,payload=? WHERE seq=?',
+                                           (previous['record_id'], canonical(previous), previous_seq))
+                            msg['base_record_id'] = msg['record_id']
+                            msg['record_id'] = extended_record_id(msg['record_id'], row)
                         db.execute('INSERT INTO records(source,identity,message_id,record_id,payload) VALUES(?,?,?,?,?)',
                                    (source, identity, msg['message_id'], msg['record_id'], canonical(msg)))
                         state['records'] += 1
@@ -204,7 +237,7 @@ async def _export_locked(options, output):
                         raise RuntimeError(f'{source} pagination returned only previously committed records')
                     state.update(pages=state['pages'] + 1, last_query=query, kinds=dict(kinds), directions=dict(directions),
                                  complete=not query['has_more'])
-                    for warning in payload.get('warnings', []):
+                    for warning in page_warnings(payload):
                         if warning not in state['warnings']:
                             state['warnings'].append(warning)
                     if query['has_more']:

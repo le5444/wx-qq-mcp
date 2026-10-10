@@ -67,32 +67,90 @@ def open_db(root, name, key):
 
 
 def sender_name(chat, chat_type, sender_uid, row, members):
-    uid = str(sender_uid or "")
-    sender_uin = str(row.get("sender_uin") or "")
-    me = str(legacy.get_self_uin() or "")
-    self_uid = (_self_identity or {}).get("uid") or os.environ.get("QQ_MCP_SELF_UID")
-    if uid and self_uid and uid == self_uid:
-        return "\u6211", "from_me"
-    if sender_uin and me and sender_uin == me:
-        return "\u6211", "from_me"
+    uid = str(sender_uid or "").strip()
+    sender_uin = str(row.get("sender_uin") or "").strip()
+    if sender_uin == "0":
+        sender_uin = ""
+    own = _self_identity or {}
+    verified_self = own.get("status", "verified") == "verified" and bool(own.get("uid"))
+    identities = []
+    if verified_self:
+        identities.append(("self", own))
     if chat_type == "private":
-        if uid and uid == str(chat.get("uid") or ""):
-            return legacy.chat_display_name(chat, chat_type), "from_contact"
-        if sender_uin and sender_uin == str(chat.get("uin") or ""):
-            return legacy.chat_display_name(chat, chat_type), "from_contact"
+        identities.append(("contact", chat))
+    elif members:
+        for member in ((members.get("by_uid") or {}).get(uid), (members.get("by_uin") or {}).get(sender_uin)):
+            if member:
+                identities.append(("member", member))
+    matched = []
+    conflict = False
+    for kind, identity in identities:
+        known_uid = str(identity.get("uid") or "").strip()
+        known_uin = str(identity.get("uin") or "").strip()
+        uid_match = bool(uid and known_uid and uid == known_uid)
+        uin_match = bool(sender_uin and known_uin and sender_uin == known_uin)
+        if ((uid_match and sender_uin and known_uin and sender_uin != known_uin)
+                or (uin_match and uid and known_uid and uid != known_uid)):
+            conflict = True
+        if uid_match or uin_match:
+            matched.append((kind, identity))
+    if conflict:
+        row.setdefault("_identity_warnings", []).append("sender_identity_conflict: UID and UIN disagree; direction is unknown")
         return uid or sender_uin or "unknown", "unknown"
-    if not uid and sender_uin in {"", "0"}:
-        return "unknown", "unknown"
-    # The legacy reader aliases 40030/40033 incorrectly. Never use its direction test.
-    clean_row = {**row, "self_uin": None}
-    return _original_sender(chat, chat_type, sender_uid, clean_row, members)
+    if not verified_self:
+        row.setdefault("_identity_warnings", []).append("self_identity_unresolved: outgoing/incoming attribution cannot be verified")
+        # Even a matching contact could be the account itself when the self
+        # profile/configuration is inconsistent. Preserve IDs, not a guess.
+        return uid or sender_uin or "unknown", "unknown"
+    for kind, identity in matched:
+        if kind == "self":
+            return "\u6211", "from_me"
+        if kind == "contact":
+            return legacy.chat_display_name(chat, chat_type), "from_contact"
+        if kind == "member":
+            return str(identity.get("display_name") or identity.get("card") or identity.get("nick") or uid or sender_uin), "from_member"
+    if chat_type != "private" and (uid or sender_uin):
+        return uid or sender_uin, "from_member"
+    return uid or sender_uin or "unknown", "unknown"
+
+
+def resolve_self_identity():
+    """Never infer the account owner from fuzzy/nickname matches."""
+    configured_uid = os.environ.get("QQ_MCP_SELF_UID", "").strip()
+    configured_uin = str(legacy.get_self_uin() or "").strip()
+    try:
+        if not configured_uid and not configured_uin:
+            raise ValueError("No account UID/UIN configured or inferred from account directory")
+        identity = legacy.exact_contact(configured_uin or configured_uid, field="uin" if configured_uin else "uid")
+        if configured_uid and identity["uid"] != configured_uid:
+            raise ValueError("Configured account UID disagrees with its exact UIN profile")
+        if configured_uin and str(identity.get("uin") or "") != configured_uin:
+            raise ValueError("Configured account UIN disagrees with its exact UID profile")
+        return {**identity, "status": "verified"}
+    except Exception as exc:
+        return {"uid": None, "uin": None, "status": "unresolved", "reason": str(exc)}
+
+
+def private_chat_where(ident):
+    """Select a conversation, never all rows authored by the account owner."""
+    own = _self_identity or {}
+    self_uid = own.get("uid") if own.get("status", "verified") == "verified" else None
+    if ident == self_uid:
+        return "[40021] = ?", [ident]
+    if self_uid:
+        return "([40021] = ? OR ([40020] = ? AND ([40021] = ? OR [40021] IS NULL OR [40021] = '')))", [ident, ident, self_uid]
+    # Without the account UID there is no safe sender-only expansion. Explicit
+    # peer_uid still locates a conversation; callers receive a coverage warning.
+    return "[40021] = ?", [ident]
 
 
 def require_unambiguous(candidates, query):
     exact = [c for c in candidates if query in {
         str(c.get(k) or "") for k in ("uid", "uin", "group_id", "display_name", "remark", "nick")
     }]
-    selected = exact or candidates
+    selected = exact
+    if not getattr(candidates, "complete", True):
+        raise ValueError("QQ contact candidates are truncated; cannot establish uniqueness")
     if len(selected) != 1:
         raise ValueError("QQ chat not uniquely identified; use resolve_contact/resolve_group and pass its stable ID.")
     return selected[0]
@@ -122,9 +180,7 @@ def query_rows(chat, chat_type, *, fts):
         db, table = "nt_msg.db", table_prefix + "_msg_table"
         fields = "[40011] AS msg_code, [40012] AS type_code, [40013] AS status_code, [40800] AS payload, [40900] AS ext_payload, [40033] AS sender_uin, [40030] AS peer_uin"
     if chat_type == "private":
-        columns = ("40021", "40020")
-        where = " OR ".join(f"[{column}] = ?" for column in columns)
-        params = [ident] * len(columns)
+        where, params = private_chat_where(ident)
     elif str(ident).isdigit():
         where, params = "[40027] = ?", [int(ident)]
     else:
@@ -166,8 +222,6 @@ def install():
     legacy.get_key = get_key
     legacy.get_key_status = key_status
     legacy.sender_name_for_record = sender_name
-    legacy.find_contact = lambda query: require_unambiguous(legacy.resolve_contacts(query, 100), query)
-    legacy.find_group = lambda query: require_unambiguous(legacy.resolve_groups(query, 100), query)
     legacy.load_chat_records = load_records
     legacy.load_fts_rows = lambda uid: query_rows({"uid": uid}, "private", fts=True)
     legacy.load_main_rows = lambda uid: query_rows({"uid": uid}, "private", fts=False)
@@ -184,9 +238,8 @@ def call(name, args):
         raise RuntimeError("QQ is not configured. Set QQ_MCP_DB_ROOT to the intended account's nt_qq/nt_db directory; WeChat remains available.")
     token = SCOPE.set(args)
     try:
-        if _self_identity is None and name not in {"diagnose", "resolve_contact", "resolve_group"}:
-            own = legacy.resolve_contacts(str(legacy.get_self_uin()), 10)
-            _self_identity = require_unambiguous(own, str(legacy.get_self_uin()))
+        if (_self_identity is None or _self_identity.get("status") == "unresolved") and name not in {"diagnose", "resolve_contact", "resolve_group"}:
+            _self_identity = resolve_self_identity()
         from . import qq_paging
         if name in {"messages", "chat_timeline", "search"}:
             if name == "search" and not str(args.get("keyword") or "").strip():

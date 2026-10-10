@@ -418,6 +418,85 @@ def normalize_contact(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _profile_columns(con):
+    return {str(row[1]) for row in con.execute("PRAGMA table_info(profile_info_v6)")}
+
+
+def _exact_profile_rows(con, columns, where, params):
+    """At most two identity pairs, not a truncated fuzzy candidate list."""
+    wanted = {"1000": "uid", "1002": "uin", "20002": "nick", "20009": "remark",
+              "20011": "signature", "20004": "avatar"}
+    selected = [f"[{key}] AS {alias}" if key in columns else f"NULL AS {alias}" for key, alias in wanted.items()]
+    uid = "[1000]" if "1000" in columns else "NULL"
+    uin = "[1002]" if "1002" in columns else "NULL"
+    cur = con.execute(f"SELECT {', '.join(selected)} FROM profile_info_v6 WHERE {where} "
+                      f"GROUP BY {uid}, {uin} LIMIT 2", params)
+    return [normalize_contact(row_dict(cur, row)) for row in cur]
+
+
+def exact_contact(query: str, *, field: str | None = None) -> dict[str, Any]:
+    """Resolve actual reads by exact IDs or an unambiguous exact name.
+
+    Discovery stays separate. Missing stable IDs never fall back to a name or
+    substring, and exact-name ambiguity is checked before any result limit.
+    """
+    value = str(query or "").strip()
+    if not value:
+        raise ValueError("QQ contact identity must be non-empty")
+    if field not in {None, "uid", "uin", "name"}:
+        raise ValueError("Unsupported QQ identity field")
+    explicit = field
+    if field is None and ":" in value and value.split(":", 1)[0] in {"uid", "uin", "name"}:
+        explicit, value = value.split(":", 1)
+        value = value.strip()
+    if not value:
+        raise ValueError("QQ contact identity must be non-empty")
+    con = open_nt_db(DEFAULT_DB_ROOT, "profile_info.db", get_key())
+    try:
+        columns = _profile_columns(con)
+        def by(fields):
+            fields = [key for key in fields if key in columns]
+            if not fields:
+                return []
+            return _exact_profile_rows(con, columns, " OR ".join(f"CAST([{key}] AS TEXT) = ?" for key in fields), [value] * len(fields))
+        if explicit == "uid":
+            found = by(["1000"])
+        elif explicit == "uin" or (explicit is None and value.isdigit()):
+            found = by(["1002"])
+        elif explicit == "name":
+            found = by(["20009", "20002"])
+        else:
+            found = by(["1000"])
+            if not found and not value.startswith("u_"):
+                found = by(["20009", "20002"])
+        if len(found) != 1:
+            raise ValueError("QQ contact has no unique exact identity; use resolve_contact and a verified UID/UIN.")
+        contact = found[0]
+        uid, uin = str(contact.get("uid") or "").strip(), str(contact.get("uin") or "").strip()
+        if not uid:
+            raise ValueError("QQ contact profile is missing UID; cannot establish the message-table identity.")
+        # Validate both directions of the UID/UIN mapping, so conflicting rows
+        # cannot bless a second person's number as this contact's alias.
+        predicates, params = ["[1000] = ?"], [uid]
+        if uin and "1002" in columns:
+            predicates.append("CAST([1002] AS TEXT) = ?")
+            params.append(uin)
+        links = _exact_profile_rows(con, columns, " OR ".join(predicates), params)
+        if len(links) != 1:
+            raise ValueError("QQ profile contains conflicting UID/UIN mappings; identity is unresolved.")
+        return {**contact, "uid": uid, "canonical_id": uid,
+                "aliases": list(dict.fromkeys([uid, *([uin] if uin else [])])),
+                "identity_verified": True, "identity_source": "profile_exact"}
+    finally:
+        con.close()
+
+
+class ResolutionCandidates(list):
+    def __init__(self, values, *, complete):
+        super().__init__(values)
+        self.complete = complete
+
+
 def resolve_contacts(keyword: str, limit: int = 10) -> list[dict[str, Any]]:
     keyword = str(keyword or "").strip()
     if not keyword:
@@ -455,7 +534,7 @@ def resolve_contacts(keyword: str, limit: int = 10) -> list[dict[str, Any]]:
             WHERE {wheres}
             LIMIT ?
             """,
-            (*params, limit * 4),
+            (*params, limit * 4 + 1),
         )
         rows = [normalize_contact(row_dict(cursor, row)) for row in cursor.fetchall()]
     finally:
@@ -478,14 +557,12 @@ def resolve_contacts(keyword: str, limit: int = 10) -> list[dict[str, Any]]:
     for row in sorted(rows, key=score):
         uid = str(row.get("uid") or row.get("uin") or row.get("display_name"))
         deduped.setdefault(uid, row)
-    return list(deduped.values())[:limit]
+    values = list(deduped.values())
+    return ResolutionCandidates(values[:limit], complete=len(rows) <= limit * 4 and len(values) <= limit)
 
 
 def find_contact(keyword: str) -> dict[str, Any]:
-    contacts = resolve_contacts(keyword, 10)
-    if not contacts:
-        raise RuntimeError(f"No QQ contact matched: {keyword}")
-    return contacts[0]
+    return exact_contact(keyword)
 
 
 def get_self_uin() -> str | None:
@@ -515,26 +592,34 @@ def normalize_chat_type(value: Any) -> str:
         "discussion": "discuss",
         "讨论组": "discuss",
     }
-    return aliases.get(raw, "private")
+    if raw not in aliases:
+        raise ValueError("Unsupported QQ chat_type; expected private, group, or discuss")
+    return aliases[raw]
 
 
 def chat_query_from_args(args: dict[str, Any]) -> str:
-    return str(
-        args.get("contact")
-        or args.get("chat")
-        or args.get("query")
-        or args.get("group")
-        or args.get("discuss")
-        or ""
-    ).strip()
+    present = [(key, str(args[key]).strip()) for key in ("contact", "chat", "query", "group", "discuss")
+               if args.get(key) not in (None, "")]
+    if len({value for _, value in present}) > 1:
+        raise ValueError("Conflicting QQ chat identity arguments; pass one contact, group, or discuss target")
+    typed = {key for key, _ in present} & {"contact", "group", "discuss"}
+    if len(typed) > 1:
+        raise ValueError("Do not combine QQ private/group/discuss target fields")
+    return present[0][1] if present else ""
 
 
 def chat_type_from_args(args: dict[str, Any]) -> str:
+    chat_query_from_args(args)
+    declared = args.get("chat_type") or args.get("chatType")
     if args.get("group") not in (None, ""):
+        if declared and normalize_chat_type(declared) != "group":
+            raise ValueError("QQ group target conflicts with chat_type")
         return "group"
     if args.get("discuss") not in (None, ""):
+        if declared and normalize_chat_type(declared) != "discuss":
+            raise ValueError("QQ discussion target conflicts with chat_type")
         return "discuss"
-    return normalize_chat_type(args.get("chat_type") or args.get("chatType"))
+    return normalize_chat_type(declared)
 
 
 def normalize_group(row: dict[str, Any]) -> dict[str, Any]:
@@ -584,7 +669,7 @@ def resolve_groups(keyword: str, limit: int = 10) -> list[dict[str, Any]]:
             WHERE {" OR ".join(wheres)}
             LIMIT ?
             """,
-            (*params, limit * 4),
+            (*params, limit * 4 + 1),
         )
         rows = [normalize_group(row_dict(cursor, row)) for row in cursor.fetchall()]
     finally:
@@ -602,14 +687,34 @@ def resolve_groups(keyword: str, limit: int = 10) -> list[dict[str, Any]]:
     deduped: dict[str, dict[str, Any]] = {}
     for row in sorted(rows, key=score):
         deduped.setdefault(str(row.get("group_id")), row)
-    return list(deduped.values())[:limit]
+    values = list(deduped.values())
+    return ResolutionCandidates(values[:limit], complete=len(rows) <= limit * 4 and len(values) <= limit)
 
 
 def find_group(keyword: str) -> dict[str, Any]:
-    groups = resolve_groups(keyword, 10)
-    if not groups:
-        raise RuntimeError(f"No QQ group matched: {keyword}")
-    return groups[0]
+    value = str(keyword or "").strip()
+    if not value:
+        raise ValueError("QQ group identity must be non-empty")
+    con = open_nt_db(DEFAULT_DB_ROOT, "group_info.db", get_key())
+    try:
+        columns = {str(row[1]) for row in con.execute("PRAGMA table_info(group_detail_info_ver1)")}
+        fields = ["[60001] AS group_id", "[60007] AS name" if "60007" in columns else "NULL AS name"]
+        if value.isdigit():
+            where, params = "[60001] = ?", [int(value)]
+        elif "60007" in columns:
+            where, params = "[60007] = ?", [value]
+        else:
+            raise ValueError("QQ group name cannot be resolved; use its numeric ID")
+        cur = con.execute(f"SELECT {', '.join(fields)} FROM group_detail_info_ver1 WHERE {where} GROUP BY [60001] LIMIT 2", params)
+        found = [normalize_group(row_dict(cur, row)) for row in cur]
+        if len(found) != 1:
+            raise ValueError("QQ group has no unique exact identity; use resolve_group and its numeric ID.")
+        group = found[0]
+        ident = str(group["group_id"])
+        return {**group, "canonical_id": ident, "aliases": list(dict.fromkeys([ident, *([value] if value.isdigit() else [])])),
+                "identity_verified": True, "identity_source": "group_profile_exact"}
+    finally:
+        con.close()
 
 
 def find_discuss(keyword: str) -> dict[str, Any]:
@@ -624,6 +729,8 @@ def find_discuss(keyword: str) -> dict[str, Any]:
         "discuss_id": int(discuss_id),
         "display_name": f"讨论组 {discuss_id}",
         "name": f"讨论组 {discuss_id}",
+        "canonical_id": str(int(discuss_id)), "aliases": list(dict.fromkeys([str(int(discuss_id)), discuss_id])),
+        "identity_verified": True, "identity_source": "explicit_numeric_discussion_id",
     }
 
 
@@ -701,7 +808,10 @@ def load_group_member_map(group_id: Any) -> dict[str, Any]:
 
 def chat_identity_value(chat: dict[str, Any], chat_type: str) -> str:
     if chat_type == "private":
-        return str(chat.get("uid") or chat.get("uin") or chat.get("id") or chat.get("display_name") or "")
+        uid = str(chat.get("uid") or "").strip()
+        if not uid:
+            raise ValueError("QQ contact UID is unresolved; refusing a potentially false empty message query")
+        return uid
     if chat_type == "group":
         return str(chat.get("group_id") or chat.get("id") or chat.get("display_name") or "")
     if chat_type == "discuss":
@@ -961,6 +1071,11 @@ def build_records(
             record["source"] = "fts_only"
         if text_source:
             record["text_source"] = text_source
+        if row.get("_identity_warnings"):
+            record["identity_status"] = "unresolved"
+            record["warnings"] = list(row["_identity_warnings"])
+        else:
+            record["identity_status"] = "verified" if direction != "unknown" else "unknown"
         if recall_info:
             record["recall"] = {
                 **recall_info,
@@ -977,7 +1092,7 @@ def build_records(
         if media:
             record["media"] = media
         if warnings and row.get("fts_only"):
-            record["warnings"] = warnings
+            record.setdefault("warnings", []).extend(warnings)
         records.append(record)
     return records
 
@@ -1003,11 +1118,11 @@ def filter_records(records: list[dict[str, Any]], args: dict[str, Any]) -> list[
     after_ts = parse_time_bound(args.get("after"))
     before_ts = parse_time_bound(args.get("before"), before=True)
     keyword = str(args.get("keyword") or "").strip().lower()
-    sender = str(args.get("sender") or "").strip()
+    sender_field, sender = sender_filter(args)
     kind = str(args.get("kind_name") or "").strip()
     result: list[dict[str, Any]] = []
     for rec in records:
-        if sender and sender not in {str(rec.get(k) or "") for k in ("sender", "sender_uid", "sender_uin", "direction")}:
+        if sender and sender != str(rec.get(sender_field) or ""):
             continue
         if kind and kind != str(rec.get("kind") or ""):
             continue
@@ -1025,6 +1140,34 @@ def filter_records(records: list[dict[str, Any]], args: dict[str, Any]) -> list[
                 continue
         result.append(rec)
     return result
+
+
+def sender_filter(args):
+    """Use one namespace per selector; numeric nicknames require sender_name."""
+    named = [(key, str(args[key]).strip()) for key in ("sender_uid", "sender_uin", "sender_name", "sender_direction")
+             if args.get(key) not in (None, "")]
+    raw = str(args.get("sender") or "").strip()
+    if len(named) > 1 or (named and raw):
+        raise ValueError("Use one QQ sender selector: UID, UIN, name, or direction")
+    mapping = {"sender_uid": "sender_uid", "sender_uin": "sender_uin", "sender_name": "sender", "sender_direction": "direction"}
+    if named:
+        key, value = named[0]
+        return mapping[key], value
+    if not raw:
+        return None, ""
+    if ":" in raw:
+        prefix, value = raw.split(":", 1)
+        if prefix in {"uid", "uin", "name", "direction"}:
+            if not value.strip():
+                raise ValueError("QQ sender selector must not be empty")
+            return {"uid": "sender_uid", "uin": "sender_uin", "name": "sender", "direction": "direction"}[prefix], value.strip()
+    if raw.isdigit():
+        return "sender_uin", raw
+    if raw.startswith("u_"):
+        return "sender_uid", raw
+    if raw in {"from_me", "from_contact", "from_member", "unknown"}:
+        return "direction", raw
+    return "sender", raw
 
 
 def window_records(records: list[dict[str, Any]], args: dict[str, Any], *, default_limit: int = 50) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1428,14 +1571,18 @@ def tool_resolve_contact(args: dict[str, Any]) -> dict[str, Any]:
     query = str(args.get("query") or args.get("contact") or args.get("keyword") or "").strip()
     limit = bounded_int(args.get("limit"), 10, 1, 100)
     candidates = resolve_contacts(query, limit)
-    return {"query": query, "returned": len(candidates), "candidates": candidates}
+    return {"query": query, "returned": len(candidates), "candidates": candidates,
+            "complete": candidates.complete, "truncated": not candidates.complete,
+            "identity_verified": False, "note": "Discovery candidates only; actual reads require exact unique UID/UIN or exact name."}
 
 
 def tool_resolve_group(args: dict[str, Any]) -> dict[str, Any]:
     query = str(args.get("query") or args.get("group") or args.get("keyword") or "").strip()
     limit = bounded_int(args.get("limit"), 10, 1, 100)
     candidates = resolve_groups(query, limit)
-    return {"query": query, "returned": len(candidates), "candidates": candidates}
+    return {"query": query, "returned": len(candidates), "candidates": candidates,
+            "complete": candidates.complete, "truncated": not candidates.complete,
+            "identity_verified": False, "note": "Discovery candidates only; actual reads require exact unique group ID or exact name."}
 
 
 def tool_messages(args: dict[str, Any]) -> dict[str, Any]:
@@ -1663,7 +1810,9 @@ for _tool in TOOLS:
             "type": "string", "description": "Opaque query.next_cursor from the previous page; do not combine with nonzero offset."}
     if _tool["name"] in {"messages", "chat_timeline", "search", "stats", "export_messages", "cache_recent", "recall_events"}:
         _tool["inputSchema"]["properties"]["sender"] = {
-            "type": "string", "description": "Exact sender UID, QQ number, display name, or direction."}
+            "type": "string", "description": "One namespace: uid:/uin:/name:/direction:. Bare digits mean UIN; u_ prefix means UID; other text means exact name."}
+        for _field in ("sender_uid", "sender_uin", "sender_name", "sender_direction"):
+            _tool["inputSchema"]["properties"][_field] = {"type": "string", "description": "Exact sender selector; choose one field and do not combine with sender."}
         _tool["inputSchema"]["properties"]["kind_name"] = {
             "type": "string", "description": "Exact normalized kind (text, image, mixed/text-image, recall/system, reply/quote, etc.)."}
 

@@ -56,7 +56,7 @@ class TimelineTests(unittest.IsolatedAsyncioTestCase):
         async def fetch(source, *_):
             if source == "qq":
                 raise RuntimeError("key unavailable")
-            return {"messages": [wx(1)], "query": {}}
+            return {"messages": [wx(1)], "query": {"has_more": False}}
         page = await merged_timeline({"wechat_chat": "w", "qq_chat": "q"}, fetch)
         self.assertEqual(page["status"], "partial")
         self.assertIn("wechat", page["available_source_pages"])

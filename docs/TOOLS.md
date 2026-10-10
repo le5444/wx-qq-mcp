@@ -1,6 +1,6 @@
 # 工具说明
 
-本文对应版本 **0.3.0 Alpha**。统一入口注册 **44 个 MCP 工具：25 个微信工具、10 个 QQ 工具、9 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
+本文对应版本 **0.3.1 Alpha**。统一入口注册 **44 个 MCP 工具：25 个微信工具、10 个 QQ 工具、9 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
 
 微信工具保留原名称，QQ 工具添加 `qq_` 前缀，跨平台能力使用 `unified_` 前缀。工具能够注册，不等于对应数据库、媒体、密钥和可选依赖都已就绪。
 
@@ -86,16 +86,19 @@ QQ 读取通过本地 Python 适配层完成，必须先明确配置目标账号
 
 `date=YYYY-MM-DD` 使用 +08:00 自然日，不能与 `after` / `before` 同传。精确定位与上下文默认 `max_scan=20000`，群统计默认 `max_messages=20000`，最多可显式设为 1000000；扫描触顶返回 `partial`，不能当作不存在或全量群统计。
 
-统一时间线每页 `limit` 为 1～500，默认 100。统一结果保留 `source`、`chat_id`、`message_id`、`record_id`、发送者、方向、时间、类型和 `original`。`record_id` 用于区分本地记录，不应仅按 `message_id` 删除看似重复的消息。
+统一时间线每页 `limit` 为 1～500，默认 100。统一结果保留 `source`、`chat_id`、`message_id`、`record_id`、发送者、方向、时间、类型和 `original`。`record_id` 用于区分本地记录，不应仅按 `message_id` 删除看似重复的消息。导出碰撞记录带 `:sha256:` 消歧后缀，精确读取和上下文支持该后缀及旧版无标签摘要。
+
+单平台可传 `sender`；同时读取两平台时，分别用 `wechat_sender` 与 `qq_sender`，不会假设两个平台同名或同一字符串代表同一个人。QQ 支持 `uid:`、`uin:`、`name:`、`direction:` 选择器；数字默认为号码，数字昵称需 `name:` 前缀。QQ 号码与 UID 经精确别名验证后返回规范 UID，继续分页时不允许该映射改变。
 
 ## 分页、失败与媒体状态
 
 - 微信原生时间线查看 `query.has_more` 和 `query.next_offset`；QQ 优先使用 `query.next_cursor`（不能同时传非零 offset），统一时间线使用 `has_more` 与 `next_cursor`。不能因为某一页为空或少于预期，就自行认定已经读完。
 - 统一游标绑定会话、时间、关键词、顺序与媒体选项。改变这些条件后应从头查询，不能复用原游标。
 - `snapshot_before` 固定的是首轮读取的时间上界，不是数据库事务快照。历史同步、迁移、删除或撤回可能改变旧记录及偏移，发生这些变化后应重新分页。
-- 任一请求的来源读取失败，统一时间线返回 `status=partial`、来源错误和已取得的 `available_source_pages`，主 `messages` 为空、游标不推进。先修复失败来源，或明确只查询可用来源；不能把它解释为“没有消息”。
+- 任一请求的来源读取失败，统一时间线返回 `status=partial`、来源错误和已经通过身份/范围校验的 `available_source_pages`，主 `messages` 为空、游标不推进。被判定为其他会话或无效页的正文不会留在诊断输出。先修复失败来源，或明确只查询可用来源；不能把它解释为“没有消息”。
 - QQ 分批查询不先加载整个范围，尚未证实终点时 `query.total=null`、`total_exact=false`。兼容的深层 offset 仍需从头跳过；完整统计调用 `qq_stats`，实现范围详见 [QQ_DATA.md](QQ_DATA.md)。
 - QQ 主消息库不可读会报错；QQ 全文检索辅助库不可读时可退回主库内容，并返回警告。这时文本覆盖可能降低。
+- 精确消息和群统计的 `coverage.pagination_complete` 表示已到分页终点，`source_complete` 表示本次依赖的数据来源是否完整可读，两者不同。来源降级时保留警告并返回 `partial`，不会证明某消息不存在。`identity_complete` 单独标记已读记录的身份冲突；未知身份不强行归给某人。
 - `media_enrichment_failed` 等警告表示媒体补充处理失败，已取得的消息仍被保留。查看具体媒体状态，不要把查询成功等同于媒体完整。
 - OCR 的 `ok` / `no_text` 和语音的 `ok` / `no_speech` 都是自动结果。`no_text` 不证明图片没有文字，`no_speech` 不证明录音没有有效内容。`partial`、`unavailable`、`audio_missing`、`not_transcribed` 等状态应原样保留。
 

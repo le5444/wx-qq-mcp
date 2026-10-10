@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 
 from unified_mcp.media_validation import validate_image_path
 from unified_mcp.wechat_media import _identity
+from unified_mcp.message_identity import IdentityError
 from unified_mcp.runtime_paths import RUNTIME
 
 HEX = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -203,18 +204,29 @@ class WeChatVideoResolver:
 
     def resolve(self, row, make_previews=False, resource_rows=None):
         with self._lock:
+            try:
+                identity = _identity(row)
+            except IdentityError as exc:
+                return {"status": "identity_unavailable", "videos": [], "reason": str(exc),
+                        "network_used": False, "whole_video_watched": False}
+            rejected = False
             for resource in resource_rows or []:
-                self.resources[_identity(resource)] = resource
-            identity = _identity(row)
-            original = self.metadata.get(identity, row)
+                try:
+                    key = _identity(resource)
+                except IdentityError:
+                    rejected = True
+                    continue
+                self.resources[key] = resource
+            original = self.metadata.get(identity, row.get('original', row))
             resource = self.resources.get(identity, {})
             ids = {str(item.get("md5", "")).lower() for item in resource.get("resources", [])
                    if item.get("resource_family") == "video" and HEX.fullmatch(str(item.get("md5", "")))}
             if not self.account:
                 return {"status": "account_unconfigured", "videos": []}
             if not ids:
-                return {"status": "metadata_missing", "videos": []}
-            timestamp = int(original.get("create_time") or row.get("create_time") or row.get("timestamp") or 0)
+                return {"status": "identity_unavailable" if rejected else "metadata_missing", "videos": [],
+                        **({"reason": "unscoped_resource_identity"} if rejected else {})}
+            timestamp = int(identity[3])
             month = dt.datetime.fromtimestamp(timestamp, TZ).strftime("%Y-%m")
             video_root = self.account / "msg/video"
             candidates = []
@@ -263,6 +275,8 @@ class WeChatVideoResolver:
                 output["wechat_video_resolution"] = {k: v for k, v in result.items() if k != "videos"}
                 if result["videos"]:
                     output["videos"] = result["videos"]
+                elif result['status'] in {'identity_unavailable', 'identity_ambiguous'}:
+                    output.pop('videos', None)
                 return output
             return {k: walk(v) for k, v in value.items()}
         return walk(payload)

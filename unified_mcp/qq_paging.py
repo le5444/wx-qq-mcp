@@ -32,7 +32,7 @@ def order_for(args):
 
 
 def fingerprint(chat, kind, args, db_root):
-    scope = {k: args.get(k) for k in ("after", "before", "keyword", "sender", "kind_name")}
+    scope = {k: args.get(k) for k in ("after", "before", "keyword", "sender", "sender_uid", "sender_uin", "sender_name", "sender_direction", "kind_name")}
     scope.update(chat=chat, kind=kind, order=order_for(args), database=str(db_root))
     return hashlib.sha256(json.dumps(scope, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -68,12 +68,19 @@ class Reader:
         self.main = self.fts = None
         self.warnings = []
         self.metrics = {"sql_pages": 0, "max_rows_in_sql_page": 0, "decoded_records": 0}
+        self.identity_complete = True
+        self.legacy.sender_filter(args)  # Validate even if the conversation is empty.
         query = self.legacy.chat_query_from_args(args)
         if not query:
             raise ValueError("QQ query requires contact/chat/group.")
         self.chat, self.kind = self.legacy.resolve_chat_entity(query, self.legacy.chat_type_from_args(args))
         self.chat = {**self.chat, "chat_type": self.kind}
         self.ident = self.legacy.chat_identity_value(self.chat, self.kind)
+        # Exact resolvers normally supply this metadata. A numeric discussion
+        # target is explicit, while private profiles must always contain a UID.
+        self.chat.setdefault("canonical_id", self.ident)
+        if not self.chat.get("identity_verified"):
+            self.chat["aliases"] = [self.ident]
         self.scope = fingerprint(self.ident, self.kind, args, self.legacy.DEFAULT_DB_ROOT)
         self.cursor = decode_cursor(args.get("cursor"), self.scope)
         if self.cursor and args.get("offset") not in (None, 0, "0"):
@@ -82,6 +89,9 @@ class Reader:
         self.fts_db = {"private": "buddy_msg_fts.db", "group": "group_msg_fts.db", "discuss": "discuss_msg_fts.db"}[self.kind]
         self.fts_table = self.fts_db[:-3]
         self.member_map = self.legacy.load_group_member_map(self.chat.get("group_id")) if self.kind == "group" else {}
+        if (adapter._self_identity or {}).get("status") == "unresolved":
+            self.identity_complete = False
+            self.warnings.append("self_identity_unresolved: account profile could not be verified; sender directions are unknown and private lookup uses peer UID only")
         try:
             self.main = adapter.open_db(self.legacy.DEFAULT_DB_ROOT, "nt_msg.db", adapter.get_key())
             self._execute(self.main, "PRAGMA temp_store = FILE", [])
@@ -125,7 +135,7 @@ class Reader:
 
     def where(self, *, times=True):
         if self.kind == "private":
-            sql, params = "([40021] = ? OR [40020] = ?)", [self.ident, self.ident]
+            sql, params = self.adapter.private_chat_where(self.ident)
         elif str(self.ident).isdigit():
             sql, params = "[40027] = ?", [int(self.ident)]
         else:
@@ -197,6 +207,11 @@ class Reader:
                 extras = self.matching_ids(ids, fts=True)
                 records = self.legacy.build_records(batch, extras, self.chat, self.kind, self.warnings, member_map=self.member_map)
             self.metrics["decoded_records"] += len(records)
+            if any(record.get("identity_status") == "unresolved" for record in records):
+                self.identity_complete = False
+                warning = "sender_identity_unresolved: one or more decoded records have identity conflicts; inspect their warnings"
+                if warning not in self.warnings:
+                    self.warnings.append(warning)
             if order_for(self.args) == "desc":
                 records.reverse()
             yield from records
@@ -243,13 +258,25 @@ class Reader:
                         "total": consumed if not more else None, "total_exact": not more,
                         "order": order_for(self.args), "display_order": display,
                         "pagination": "keyset", "read_metrics": dict(self.metrics),
-                        "coverage": "Live local databases, not an immutable snapshot; restart after history migration."}
+                        "canonical_chat_id": self.ident, "coverage": self.coverage(not more)}
+
+    def coverage(self, pagination_complete):
+        reasons = []
+        if self.fts is None:
+            reasons.append("fts_unavailable")
+        if (self.adapter._self_identity or {}).get("status") == "unresolved" and self.kind == "private":
+            reasons.append("self_identity_unresolved")
+        return {"pagination_complete": pagination_complete, "source_complete": not reasons,
+                "reason": reasons[0] if reasons else "local_sources_readable", "reasons": reasons,
+                "identity_complete": self.identity_complete, "scope": "local_live_databases",
+                "note": "Local synchronized records only; not an immutable snapshot. Restart after history migration."}
 
 
 def messages(adapter, args):
     with Reader(adapter, args) as reader:
         rows, query = reader.page()
         return {"chat": reader.chat, "contact": reader.chat, "warnings": reader.warnings,
+                "coverage": query["coverage"],
                 "query": {"contact": adapter.legacy.chat_query_from_args(args), "chat_type": reader.kind,
                           "after": args.get("after"), "before": args.get("before"), "keyword": args.get("keyword"), **query},
                 "messages": adapter.legacy.strip_media_if_needed(rows, args.get("include_media", True))}
@@ -260,6 +287,7 @@ def cache_recent(adapter, args):
         rows, query = reader.page(limit=500, max_limit=10000)
         result = adapter.legacy.merge_cached_records(reader.chat, rows)
         return {"contact": reader.chat, "chat": reader.chat, "warnings": reader.warnings,
+                "coverage": query["coverage"],
                 "query": query, "cache": result,
                 "messages": adapter.legacy.strip_media_if_needed(rows, args.get("include_media", False))}
 
@@ -269,11 +297,19 @@ class Summary:
         self.months, self.senders, self.kinds = Counter(), Counter(), Counter()
         self.total = self.text = 0
         self.first = self.last = None
+        self.sender_names = {}
+        self.unresolved_senders = 0
 
     def add(self, row):
         self.total += 1
         self.text += bool(row.get("text"))
-        self.senders[str(row.get("sender") or "")] += 1
+        uid, uin = str(row.get("sender_uid") or "").strip(), str(row.get("sender_uin") or "").strip()
+        unresolved = row.get("identity_status") == "unresolved"
+        self.unresolved_senders += unresolved
+        sender_key = ("unknown" if unresolved else
+                      "uid:" + uid if uid else "uin:" + uin if uin and uin != "0" else "unknown")
+        self.senders[sender_key] += 1
+        self.sender_names.setdefault(sender_key, set()).add("unknown" if unresolved else str(row.get("sender") or ""))
         self.kinds[str(row.get("kind") or "")] += 1
         if row.get("time"):
             self.months[str(row["time"])[:7]] += 1
@@ -288,7 +324,12 @@ class Summary:
                 "media_or_unindexed_messages": self.total - self.text,
                 "first_time": self.first[1] if self.first else None,
                 "last_time": self.last[1] if self.last else None,
-                "by_sender": dict(self.senders), "by_kind": dict(self.kinds), "by_month": dict(sorted(self.months.items()))}
+                "by_sender": dict(self.senders),
+                "senders": [{"sender_id": key, "display_names": sorted(self.sender_names.get(key, set())), "count": count}
+                            for key, count in self.senders.most_common()],
+                "unknown_sender_count": self.senders.get("unknown", 0),
+                "unresolved_sender_count": self.unresolved_senders,
+                "by_kind": dict(self.kinds), "by_month": dict(sorted(self.months.items()))}
 
 
 def stats(adapter, args):
@@ -296,7 +337,8 @@ def stats(adapter, args):
     with Reader(adapter, args) as reader:
         for row in reader.records():
             summary.add(row)
-        return {**summary.value(reader.chat), "warnings": reader.warnings, "read_metrics": reader.metrics}
+        return {**summary.value(reader.chat), "chat": reader.chat, "warnings": reader.warnings,
+                "read_metrics": reader.metrics, "coverage": reader.coverage(True)}
 
 
 def export_messages(adapter, args):
@@ -340,10 +382,13 @@ def export_messages(adapter, args):
                             stream.write("  - 媒体线索（不等同文件可用）: " + json.dumps(row["media"], ensure_ascii=False) + "\n")
                 if fmt == "markdown":
                     stream.write(f"\n---\n导出消息数: {summary.total}；达到上限而截断: {truncated}\n")
+                    stream.write("读取覆盖: " + json.dumps(reader.coverage(not truncated), ensure_ascii=False) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+                coverage = reader.coverage(not truncated)
                 result = {"path": str(path), "format": fmt, "messages": summary.total,
-                          "truncated": truncated, "complete": not truncated, "warnings": reader.warnings,
+                          "truncated": truncated, "complete": not truncated and coverage["source_complete"],
+                          "coverage": coverage, "chat": reader.chat, "warnings": reader.warnings,
                           "read_metrics": reader.metrics, **summary.value(reader.chat)}
             if overwrite:
                 os.replace(temp, path)
@@ -363,6 +408,7 @@ def recall_events(adapter, args):
     cache_window = legacy.bounded_int(args.get("cache_window_seconds"), 3600, 0, 86400)
     include_media = args.get("include_media", False)
     events, active = [], []
+    pagination_complete = True
     previous = deque(maxlen=size)
     with Reader(adapter, args) as reader:
         for row in reader.records():
@@ -376,6 +422,7 @@ def recall_events(adapter, args):
                     active.append(item)
             previous.append(row)
             if len(events) >= limit and not active:
+                pagination_complete = False
                 break
         # Keep only cached IDs that actually occur in either current source.
         # This avoids holding every live message just to test membership.
@@ -394,6 +441,7 @@ def recall_events(adapter, args):
             item["cache_lookup"] = legacy.find_cached_recall_candidates(reader.chat, item["event"], live, window_seconds=cache_window, limit=5)
             item["event"] = legacy.strip_media_if_needed([item["event"]], include_media)[0]
         return {"contact": reader.chat, "chat": reader.chat, "warnings": reader.warnings,
+                "coverage": reader.coverage(pagination_complete),
                 "query": {"chat_type": reader.kind, "limit": limit, "order": order_for(args), "context_window": size,
                           "after": args.get("after"), "before": args.get("before"), "cache_window_seconds": cache_window},
                 "returned": len(events), "events": events, "read_metrics": reader.metrics,

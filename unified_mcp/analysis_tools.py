@@ -5,6 +5,9 @@ import datetime as dt
 from collections import Counter
 
 from unified_mcp.timeline import TZ, date_scope, start_bound, end_bound, decoded_result, normal_message
+from unified_mcp.read_contract import canonical_chat, page_source_complete, page_warnings, validate_record_chat
+from unified_mcp.record_identity import split_record_id, matches_record_id, stable_raw
+from unified_mcp.enrichment_updates import merge_update
 
 
 def bounded(value, default, maximum, name):
@@ -36,17 +39,25 @@ class Scan:
         self.args, self.fetch, self.maximum = args, fetch, maximum
         self.order, self.media = order, media
         self.scanned, self.complete, self.error, self.limited = 0, False, None, False
+        self.pagination_complete, self.source_complete = False, True
+        self.identity_complete = True
+        self.warnings = []
+        self.canonical = None
 
     @property
     def coverage(self):
         return {"complete": self.complete, "scanned": self.scanned, "limited": self.limited,
-                "error": self.error, "scope": "locally synchronized records in requested range"}
+                "error": self.error, "pagination_complete": self.pagination_complete,
+                "source_complete": self.source_complete, "warnings": self.warnings,
+                "identity_complete": self.identity_complete,
+                "scope": "locally synchronized records in requested range"}
 
     async def rows(self):
         a, offset, cursor = self.args, 0, None
         previous_time = None
         if a.get("after") and int(a["after"]) >= int(a["before"]):
             self.complete = True
+            self.pagination_complete = True
             return
         while self.scanned < self.maximum:
             source, chat = a["source"], a["chat_id"]
@@ -62,6 +73,13 @@ class Scan:
             params = {k: v for k, v in params.items() if v is not None}
             try:
                 page = decoded_result(await self.fetch(source, "chat_timeline", params))
+                for warning in page_warnings(page):
+                    if warning not in self.warnings:
+                        self.warnings.append(warning)
+                self.source_complete &= page_source_complete(page)
+                if isinstance(page.get("coverage"), dict) and page["coverage"].get("identity_complete") is False:
+                    self.identity_complete = False
+                canonical = canonical_chat(source, page, chat, self.canonical, chat_type=a.get("chat_type") if source == "qq" else None)
                 rows = page.get("messages")
                 if not isinstance(rows, list) or page.get("errors") or page.get("status") == "partial":
                     raise RuntimeError("Incomplete or invalid source page")
@@ -72,13 +90,14 @@ class Scan:
                     raise RuntimeError("Empty nonterminal source page cannot advance")
                 if len(rows) > params["limit"]:
                     raise RuntimeError("Source ignored the requested page limit")
+                checked = []
                 for row in rows:
                     if row.get("error"):
                         raise RuntimeError("Source record could not be read")
-                    native_chat = row.get("talker") or (row.get("id") or {}).get("talker") if source == "wechat" else row.get("chat_id")
-                    if native_chat and str(native_chat) != chat:
-                        raise RuntimeError("Source record belongs to a different chat")
-                    item = normal_message(source, row, chat)
+                    validate_record_chat(source, row, canonical, chat_type=a.get("chat_type") if source == "qq" else None)
+                    item = normal_message(source, row, canonical)
+                    if item["identity_status"] in {"unresolved", "conflict"}:
+                        self.identity_complete = False
                     timestamp = item.get("timestamp")
                     if timestamp is None or (a.get("after") and int(timestamp) < int(a["after"])) or int(timestamp) >= int(a["before"]):
                         raise RuntimeError("Source record escaped requested time scope")
@@ -86,10 +105,15 @@ class Scan:
                                                       (self.order == "desc" and timestamp > previous_time)):
                         raise RuntimeError("Source records are not in requested time order")
                     previous_time = timestamp
+                    checked.append(item)
+                self.canonical = canonical
+                # Validate the entire bounded page before publishing any row.
+                for item in checked:
                     self.scanned += 1
                     yield item
                 if not more:
-                    self.complete = True
+                    self.pagination_complete = True
+                    self.complete = self.source_complete
                     return
                 next_cursor = page.get("query", {}).get("next_cursor")
                 if next_cursor and next_cursor == cursor:
@@ -109,13 +133,10 @@ def identity_scope(args):
         raise ValueError("Specify exactly one of record_id or message_id")
     if record_id:
         prefix = result["chat_id"] + ":"
-        if not record_id.startswith(prefix):
-            raise ValueError("record_id belongs to a different chat")
         if result["source"] == "wechat":
+            base, _ = split_record_id("wechat", result["chat_id"], record_id)
             # Only intersect the user's scope; a foreign date must stay empty.
-            parts = record_id[len(prefix):].rsplit(":", 3)
-            if len(parts) != 4:
-                raise ValueError("Invalid WeChat record_id")
+            parts = base[len(prefix):].rsplit(":", 3)
             timestamp = int(parts[-2])
             result["after"] = str(max(int(result.get("after") or timestamp), timestamp))
             result["before"] = str(min(int(result["before"]), timestamp + 1))
@@ -127,10 +148,10 @@ async def message(args, fetch):
     scan = Scan(a, fetch, bounded(args.get("max_scan"), 20000, 1000000, "max_scan"))
     matches = []
     async for row in scan.rows():
-        if (row["record_id"] == args.get("record_id") or
+        if ((args.get("record_id") and matches_record_id(a["source"], row["chat_id"], row["original"], args["record_id"])) or
                 (args.get("message_id") is not None and row["message_id"] == str(args["message_id"]))):
             matches.append(row)
-    result = {"status": "partial", "coverage": scan.coverage}
+    result = {"status": "partial", "coverage": scan.coverage, "warnings": list(scan.warnings)}
     if not scan.complete:
         if matches:
             result["candidates"] = matches
@@ -140,15 +161,33 @@ async def message(args, fetch):
     if len(matches) > 1:
         return {**result, "status": "ambiguous", "candidates": matches}
     selected = matches[0]
+    if args.get("record_id") and selected["record_id"] != args["record_id"]:
+        selected = {**selected, "base_record_id": selected["record_id"], "record_id": args["record_id"]}
     if args.get("include_media", True):
         rich_scope = {**a, "after": str(selected["timestamp"]), "before": str(selected["timestamp"] + 1)}
         rich = Scan(rich_scope, fetch, 20000, media=True)
+        candidates = []
         async for candidate in rich.rows():
-            if candidate["record_id"] == selected["record_id"]:
-                selected = candidate
-                break
-        if rich.error:
-            result["warnings"] = ["media lookup failed; original record preserved: " + rich.error]
+            if matches_record_id(a["source"], candidate["chat_id"], candidate["original"], selected["record_id"]):
+                candidates.append(candidate)
+        result["warnings"].extend(w for w in rich.warnings if w not in result["warnings"])
+        if not rich.complete:
+            result["warnings"].append("media lookup incomplete; original record preserved")
+        elif len(candidates) != 1:
+            result["warnings"].append("media lookup missing or ambiguous; original record preserved")
+        else:
+            candidate = candidates[0]
+            old_raw, new_raw = stable_raw(selected["original"]), stable_raw(candidate["original"])
+            fields = ("text", "kind", "create_time", "msg_id", "timestamp", "seq", "type_code", "msg_code",
+                      "sender_wxid", "sender_uid", "sender_uin", "is_from_me", "direction")
+            if any(key in old_raw and new_raw.get(key) != old_raw[key] for key in fields):
+                result["warnings"].append("source message changed during media lookup; original record preserved")
+            else:
+                candidate["record_id"] = selected["record_id"]
+                try:
+                    selected = merge_update(selected, candidate)
+                except ValueError:
+                    result["warnings"].append("media identity mismatch; original record preserved")
     return {**result, "status": "ok", "message": selected}
 
 
@@ -174,29 +213,33 @@ async def context(args, fetch):
         scan = Scan(window, fetch, maximum, order=order, media=args.get("include_media", True))
         if requested:
             async for row in scan.rows():
-                if row["record_id"] == target["record_id"]:
+                if matches_record_id(a["source"], row["chat_id"], row["original"], target["record_id"]):
                     seen = True
-                    target = row
+                    target = {**row, "record_id": target["record_id"],
+                              **({"base_record_id": target["base_record_id"]} if target.get("base_record_id") else {})}
                 elif seen:
                     selected.append(row)
                     if len(selected) == requested:
                         break
-        done = not requested or len(selected) == requested or (seen and scan.complete)
+        done = not requested or (scan.source_complete and not scan.error and (len(selected) == requested or (seen and scan.complete)))
         coverage[side] = {**scan.coverage, "complete": done}
         neighbors[side] = list(reversed(selected)) if side == "before" else selected
     complete = all(item["complete"] for item in coverage.values())
     return {"status": "ok" if complete else "partial", "target": target, **neighbors,
             "coverage": {"complete": complete, "sides": coverage,
-                         "scanned": located["coverage"]["scanned"] + sum(c["scanned"] for c in coverage.values())}}
+                         "scanned": located["coverage"]["scanned"] + sum(c["scanned"] for c in coverage.values())},
+            "warnings": located.get("warnings", []) + [w for side in coverage.values() for w in side["warnings"]]}
 
 
 async def group_stats(args, fetch):
     a = scope(args, group=True)
     scan = Scan(a, fetch, bounded(args.get("max_messages"), 20000, 1000000, "max_messages"))
     senders, kinds, days, names = Counter(), Counter(), Counter(), {}
+    unresolved = 0
     async for row in scan.rows():
         sender = row.get("sender_id") or None
         senders[sender] += 1
+        unresolved += row.get("identity_status") in {"unresolved", "conflict"}
         if sender and row.get("sender_name"):
             names[sender] = row["sender_name"]
         kinds[row.get("kind") or "unknown"] += 1
@@ -204,10 +247,12 @@ async def group_stats(args, fetch):
     sender_rows = [{"sender_id": sender, "sender_name": names.get(sender), "count": count}
                    for sender, count in senders.most_common()]
     summary = {"total_messages": scan.scanned, "unknown_sender_count": senders.get(None, 0),
+               "unresolved_identity_count": unresolved,
                "system_messages": kinds.get("system", 0), "senders": sender_rows,
                "by_kind": dict(kinds), "by_day": dict(sorted(days.items()))}
-    return {"status": "ok" if scan.complete else "partial", "source": a["source"], "chat_id": a["chat_id"],
+    return {"status": "ok" if scan.complete else "partial", "source": a["source"], "chat_id": scan.canonical or a["chat_id"],
             "summary": summary, "coverage": scan.coverage,
+            "warnings": list(scan.warnings),
             "note": "Counts include separately labeled system records; display names are not identities. Topic or relationship analysis requires reading supporting messages."}
 
 

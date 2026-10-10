@@ -7,21 +7,23 @@ import datetime as dt
 import hashlib
 import json
 
+from unified_mcp.read_contract import canonical_chat, page_source_complete, page_warnings, validate_record_chat, validated_page_projection
+
 TZ = dt.timezone(dt.timedelta(hours=8))
 
 
 def decoded_result(result):
     if isinstance(result, dict):
-        return result
-    if result.isError:
-        text = "\n".join(b.text for b in result.content if b.type == "text")
-        raise RuntimeError(text)
-    blocks = [b.text for b in result.content if b.type == "text"]
-    data = json.loads(blocks[0]) if len(blocks) == 1 else None
+        data = result
+    else:
+        if result.isError:
+            raise RuntimeError("Backend reported a tool failure; requested records were not verified")
+        blocks = [b.text for b in result.content if b.type == "text"]
+        data = json.loads(blocks[0]) if len(blocks) == 1 else None
     if not isinstance(data, dict):
         raise RuntimeError("Backend returned an unsupported result shape")
-    if data.get("error"):
-        raise RuntimeError(str(data["error"]))
+    if data.get("error") or data.get("errors") or data.get("status") in {"error", "failed", "partial"}:
+        raise RuntimeError("Backend reported an incomplete or failed read")
     return data
 
 
@@ -32,6 +34,8 @@ def normal_message(source, row, chat):
         sender_id = row.get("sender_wxid")
         from_me = row.get("is_from_me")
         direction = "outgoing" if from_me is True else "incoming" if from_me is False else "unknown"
+        if not sender_id and row.get("kind") == "system":
+            direction = "system"
         timestamp = row.get("create_time")
         # A text message and a related system record can share a server ID.
         # Preserve the native message_id, but expose a separate local record ID.
@@ -42,17 +46,21 @@ def normal_message(source, row, chat):
         direction = {"from_me": "outgoing", "from_contact": "incoming", "from_member": "incoming"}.get(row.get("direction"), "unknown")
         timestamp = row.get("timestamp")
         record_id = f"{chat}:{message_id}"
+    identity_conflict = any("sender_identity_conflict" in str(warning) for warning in row.get("warnings", []))
+    if identity_conflict:
+        sender_id, direction = None, "unknown"
     return {
         "source": source, "chat_id": chat, "message_id": message_id, "record_id": record_id,
         "time": row.get("time_iso") or row.get("time"), "timestamp": timestamp,
-        "sender_id": sender_id, "sender_name": row.get("sender"), "direction": direction,
+        "sender_id": sender_id, "sender_name": "unknown" if identity_conflict else row.get("sender"), "direction": direction,
+        "identity_status": "conflict" if identity_conflict else row.get("identity_status", "unknown" if not sender_id else "reported"),
         "kind": row.get("kind"), "text": row.get("text", ""),
         "original": row,
     }
 
 
 def fingerprint(args):
-    scope = {k: args.get(k) for k in ("wechat_chat", "qq_chat", "qq_chat_type", "date", "after", "before", "keyword", "sender", "kind_name", "order", "include_media", "include_image_text")}
+    scope = {k: args.get(k) for k in ("wechat_chat", "qq_chat", "qq_chat_type", "date", "after", "before", "keyword", "sender", "wechat_sender", "qq_sender", "kind_name", "order", "include_media", "include_image_text")}
     return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
 
 
@@ -116,12 +124,16 @@ async def merged_timeline(args, fetch):
     order = args.get("order", "desc")
     if order not in {"asc", "desc"}:
         raise ValueError("order must be asc or desc")
+    if args.get("sender") and len(chats) > 1:
+        raise ValueError("For two platforms use wechat_sender and qq_sender separately; sender identities are platform-specific")
+    if args.get("sender") and any(args.get(source + "_sender") for source in chats):
+        raise ValueError("Use sender or a platform-specific sender, not both")
     state = read_cursor(args.get("cursor"), args)
     pages, errors, pool = {}, {}, []
     for source, chat in chats.items():
         params = {"chat": chat, "contact": chat, "after": start_bound(args.get("after")),
                   "before": end_bound(args.get("before"), state["snapshot_before"]),
-                  "keyword": args.get("keyword"), "sender": args.get("sender"),
+                  "keyword": args.get("keyword"), "sender": args.get(source + "_sender") or args.get("sender"),
                   "kind_name": args.get("kind_name"), "limit": limit + 1,
                   "offset": state["offsets"].get(source, 0), "order": order,
                   "display_order": order}
@@ -138,23 +150,22 @@ async def merged_timeline(args, fetch):
         params["include_image_text"] = args.get("include_image_text", True)
         try:
             page = decoded_result(await fetch(source, "chat_timeline", params))
-            if page.get("errors"):
-                raise RuntimeError(str(page["errors"]))
             if not isinstance(page.get("messages"), list):
                 raise RuntimeError("Backend omitted messages")
             if not page["messages"] and page.get("query", {}).get("has_more"):
                 raise RuntimeError("Backend returned an empty nonterminal page; pagination cannot advance safely")
             if any(m.get("error") for m in page["messages"]):
                 raise RuntimeError("Some records failed to read; inspect the native source tool")
-            pages[source] = page
             if type(page.get("query", {}).get("has_more")) is not bool:
                 raise RuntimeError("Backend omitted an explicit pagination endpoint")
+            if len(page["messages"]) > params["limit"]:
+                raise RuntimeError("Backend ignored requested page size")
+            canonical = canonical_chat(source, page, chat, state.get("canonical_chats", {}).get(source), chat_type=args.get("qq_chat_type", "private") if source == "qq" else None)
+            source_pool = []
             previous_time = None
             for index, row in enumerate(page["messages"]):
-                native_chat = (row.get("talker") or (row.get("id") or {}).get("talker")) if source == "wechat" else row.get("chat_id")
-                if native_chat and str(native_chat) != chat:
-                    raise RuntimeError("Backend returned a record from another chat")
-                msg = normal_message(source, row, chat)
+                validate_record_chat(source, row, canonical, chat_type=args.get("qq_chat_type", "private") if source == "qq" else None)
+                msg = normal_message(source, row, canonical)
                 if msg["timestamp"] is None:
                     raise RuntimeError("Missing timestamp; cannot merge reliably")
                 timestamp = int(msg["timestamp"])
@@ -164,12 +175,17 @@ async def merged_timeline(args, fetch):
                     raise RuntimeError("Backend did not respect requested time order")
                 previous_time = timestamp
                 # Index preserves the backend's ordering for same-second messages.
-                pool.append((source, index, msg))
+                source_pool.append((source, index, msg))
+            pages[source] = page
+            state.setdefault("canonical_chats", {})[source] = canonical
+            if not page_source_complete(page):
+                raise RuntimeError("Source is degraded; pagination alone cannot prove complete history")
+            pool.extend(source_pool)
         except Exception as exc:
             errors[source] = str(exc)
     if errors:
         return {"status": "partial", "errors": errors, "messages": [],
-                "available_source_pages": pages, "next_cursor": None,
+                "available_source_pages": {source: validated_page_projection(page) for source, page in pages.items()}, "next_cursor": None,
                 "note": "No cursor advanced. Fix the failed source or explicitly query the available source alone."}
     pool.sort(key=lambda item: ((-1 if order == "desc" else 1) * int(item[2]["timestamp"]), item[0], item[1]))
     chosen = pool[:limit]
@@ -181,7 +197,7 @@ async def merged_timeline(args, fetch):
         state["offsets"][source] += consumed[source]
         more |= consumed[source] < len(page["messages"]) or bool(page.get("query", {}).get("has_more"))
         metadata[source] = {"query": page.get("query"), "freshness": page.get("freshness"), "consumed": consumed[source]}
-        warnings += [{"source": source, "warning": warning} for warning in page.get("warnings", [])]
+        warnings += [{"source": source, "warning": warning} for warning in page_warnings(page)]
     return {"status": "ok", "messages": [m for _, _, m in chosen], "returned": len(chosen),
             "has_more": more, "next_cursor": write_cursor(state) if more else None,
             "snapshot_before": state["snapshot_before"], "sources": metadata, "warnings": warnings,

@@ -25,9 +25,11 @@ class ReaderExportTests(unittest.TestCase):
             a={'source':'wechat','record_id':'local:1','message_id':'same','kind':'text','text':'first','original':{}}
             b={**a,'record_id':'local:2','text':'second'}
             source.write_text(json.dumps(a)+'\n'+json.dumps(b),encoding='utf-8')
-            update.write_text(json.dumps({**a,'text':'updated'}),encoding='utf-8')
+            update.write_text(json.dumps({**a,'text':'untrusted replacement','image_text':[{'status':'ok','text':'derived OCR'}]}),encoding='utf-8')
             output=root/'reader.html';build(source,output,updates=update)
-            self.assertIn('updated',output.read_text(encoding='utf-8'))
+            self.assertIn('derived OCR',output.read_text(encoding='utf-8'))
+            self.assertIn('first',output.read_text(encoding='utf-8'))
+            self.assertNotIn('untrusted replacement',output.read_text(encoding='utf-8'))
             self.assertIn('second',output.read_text(encoding='utf-8'))
 
     def test_remote_or_missing_files_do_not_become_live_media_urls(self):
