@@ -107,7 +107,9 @@ class WeChatMediaResolver:
         self._plaintext = defaultdict(list)
         self._named = defaultdict(list)
         self._indexed_chats = {}
-        self._global_indexed = 0
+        # A monotonic clock has an arbitrary origin; on a freshly booted host
+        # zero can be less than one cache interval ago. None means never scanned.
+        self._global_indexed = None
         account_tag = hashlib.sha256(str(self.account).encode()).hexdigest()[:16]
         self._index_path = RUNTIME / ("wechat-content-index-" + account_tag + ".json")
         try:
@@ -163,13 +165,14 @@ class WeChatMediaResolver:
             self._named[match[1].lower()].append(path)
 
     def _index(self, talker):
-        if time.monotonic() - self._global_indexed > 300:
+        if self._global_indexed is None or time.monotonic() - self._global_indexed >= 300:
             for root in (self.data_root / "Emojis", self.account / "temp" if self.account else self.data_root / "__missing__",
                          RUNTIME / "sticker-download"):
                 for path in _files(root):
                     self._index_plain(path)
             self._global_indexed = time.monotonic()
-        if time.monotonic() - self._indexed_chats.get(talker, 0) < 300:
+        last_indexed = self._indexed_chats.get(talker)
+        if last_indexed is not None and time.monotonic() - last_indexed < 300:
             return
         if not re.fullmatch(r"[\w@.-]+", talker):
             return
