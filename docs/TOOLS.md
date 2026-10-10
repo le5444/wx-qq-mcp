@@ -1,6 +1,6 @@
 # 工具说明
 
-本文对应版本 **0.3.1 Alpha**。统一入口注册 **44 个 MCP 工具：25 个微信工具、10 个 QQ 工具、9 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
+本文对应版本 **0.3.2 Alpha**。统一入口注册 **44 个 MCP 工具：25 个微信工具、10 个 QQ 工具、9 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
 
 微信工具保留原名称，QQ 工具添加 `qq_` 前缀，跨平台能力使用 `unified_` 前缀。工具能够注册，不等于对应数据库、媒体、密钥和可选依赖都已就绪。
 
@@ -75,7 +75,7 @@ QQ 读取通过本地 Python 适配层完成，必须先明确配置目标账号
 | 工具 | 用途 | 参数与返回重点 |
 | --- | --- | --- |
 | `unified_sources` | 查看两个来源的配置及当前运行状态 | 无参数；微信侧是读取器文件、是否活跃、会话内启动状态，QQ 侧执行诊断；不证明所有媒体或查询均正常 |
-| `unified_resolve_chat` | 同时查找微信和 QQ 候选 | 必填 `query`；`qq_chat_type=group` 查 QQ 群，否则查私聊联系人；不会按同名自动合并身份 |
+| `unified_resolve_chat` | 按平台查找联系人或群候选 | 必填 `query`；`source=wechat/qq/both`，默认both；`wechat_type_filter=group`限定微信群，`qq_chat_type=group`查QQ群；`limit`为1～100；不会按同名自动合并身份 |
 | `unified_timeline` | 按时间合并一个或两个平台的会话 | 至少提供 `wechat_chat` 或 `qq_chat`；支持 `date` 或起止时间、关键词、`sender`、`kind_name`、排序、`cursor`、媒体及 OCR 开关 |
 | `unified_search` | 在指定的一个或两个平台会话中搜索并合并 | 时间线参数加非空 `keyword`；不是全账号跨平台搜索 |
 | `unified_read_image` | 读取一个本地图片或表情的 OCR 与图片预览 | 必填 `path`；`include_image=false` 不附图片块；OCR 不可用时可解码图片仍可预览，动画预览只取首帧 |
@@ -85,6 +85,8 @@ QQ 读取通过本地 Python 适配层完成，必须先明确配置目标账号
 | `unified_health` | 无数据读取的快速健康检查 | 无参数；返回版本、PID、微信进程、QQ 队列和识别服务状态，不证明数据库、媒体或模型能成功读取 |
 
 `date=YYYY-MM-DD` 使用 +08:00 自然日，不能与 `after` / `before` 同传。精确定位与上下文默认 `max_scan=20000`，群统计默认 `max_messages=20000`，最多可显式设为 1000000；扫描触顶返回 `partial`，不能当作不存在或全量群统计。
+
+显式空日期或空时间边界不代表全量，会被拒绝；反向范围也会在查询前拒绝。时间接受`YYYY-MM-DD`、ISO日期时间、整数Unix秒和13位毫秒；八位数字时间（如`20261009`）存在日期/秒歧义，必须改成明确写法；非零小数秒不会被悄悄舍入。纯日期`before`包含整天，ISO/Unix截止点不包含该时刻。前后文会重新验证目标所在同秒的唯一性和两次读取的一致性，发生变化时保留原目标并返回partial，不把不可靠邻居当作正常上下文。
 
 统一时间线每页 `limit` 为 1～500，默认 100。统一结果保留 `source`、`chat_id`、`message_id`、`record_id`、发送者、方向、时间、类型和 `original`。`record_id` 用于区分本地记录，不应仅按 `message_id` 删除看似重复的消息。导出碰撞记录带 `:sha256:` 消歧后缀，精确读取和上下文支持该后缀及旧版无标签摘要。
 

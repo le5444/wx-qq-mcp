@@ -175,24 +175,8 @@ def bounded_int(value: Any, default: int, min_value: int, max_value: int) -> int
 
 
 def parse_time_bound(value: Any, *, before: bool = False) -> int | None:
-    if value in (None, ""):
-        return None
-    raw = str(value).strip()
-    if not raw:
-        return None
-    if re.fullmatch(r"\d{10,13}", raw):
-        ts = int(raw)
-        return ts // 1000 if len(raw) == 13 else ts
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-        parsed = dt.datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
-        if before:
-            parsed += dt.timedelta(days=1)
-        return int(parsed.timestamp())
-    normalized = raw.replace("Z", "+00:00")
-    parsed = dt.datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=LOCAL_TZ)
-    return int(parsed.timestamp())
+    from unified_mcp.time_scope import parse_time_bound as parse
+    return parse(value, before=before)
 
 
 def extract_blob_hints(blob: Any) -> dict[str, Any]:
