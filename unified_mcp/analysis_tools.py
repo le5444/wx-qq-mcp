@@ -6,8 +6,9 @@ from collections import Counter
 
 from unified_mcp.timeline import TZ, date_scope, start_bound, end_bound, decoded_result, normal_message
 from unified_mcp.read_contract import canonical_chat, page_source_complete, page_warnings, validate_record_chat
-from unified_mcp.record_identity import split_record_id, matches_record_id, stable_raw
+from unified_mcp.record_identity import split_record_id, matches_record_id, stable_raw, raw_fingerprint
 from unified_mcp.enrichment_updates import merge_update
+from unified_mcp.time_scope import message_timestamp
 
 
 def bounded(value, default, maximum, name):
@@ -98,7 +99,7 @@ class Scan:
                     item = normal_message(source, row, canonical)
                     if item["identity_status"] in {"unresolved", "conflict"}:
                         self.identity_complete = False
-                    timestamp = item.get("timestamp")
+                    timestamp = message_timestamp(item.get("timestamp"))
                     if timestamp is None or (a.get("after") and int(timestamp) < int(a["after"])) or int(timestamp) >= int(a["before"]):
                         raise RuntimeError("Source record escaped requested time scope")
                     if previous_time is not None and ((self.order == "asc" and timestamp < previous_time) or
@@ -129,7 +130,10 @@ class Scan:
 def identity_scope(args):
     result = scope(args)
     record_id, message_id = args.get("record_id"), args.get("message_id")
-    if bool(record_id) == bool(message_id):
+    for name, value in (("record_id", record_id), ("message_id", message_id)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(name + " must be a nonempty string")
+    if (record_id is not None) == (message_id is not None):
         raise ValueError("Specify exactly one of record_id or message_id")
     if record_id:
         prefix = result["chat_id"] + ":"
@@ -141,6 +145,26 @@ def identity_scope(args):
             result["after"] = str(max(int(result.get("after") or timestamp), timestamp))
             result["before"] = str(min(int(result["before"]), timestamp + 1))
     return result
+
+
+def _same_source_record(original, candidate):
+    """Compare source facts while allowing later derived media metadata.
+
+Missing/changed original text is a change even when the earlier text was empty.
+Display names and newly available media metadata are not immutable identity.
+"""
+    if any(original.get(key) != candidate.get(key) for key in
+           ("source", "chat_id", "message_id", "timestamp", "sender_id", "direction", "kind")):
+        return False
+    old_raw, new_raw = stable_raw(original["original"]), stable_raw(candidate["original"])
+    fields = ("text", "kind", "kind_name", "create_time", "msg_id", "timestamp", "seq", "type_code", "msg_code",
+              "sender_wxid", "sender_uid", "sender_uin", "is_from_me", "direction")
+    return not any(key in old_raw and new_raw.get(key) != old_raw[key] for key in fields)
+
+
+def _merge_target_media(original, candidate):
+    update = {**candidate, "record_id": original["record_id"]}
+    return merge_update(original, update)
 
 
 async def message(args, fetch):
@@ -177,15 +201,11 @@ async def message(args, fetch):
             result["warnings"].append("media lookup missing or ambiguous; original record preserved")
         else:
             candidate = candidates[0]
-            old_raw, new_raw = stable_raw(selected["original"]), stable_raw(candidate["original"])
-            fields = ("text", "kind", "create_time", "msg_id", "timestamp", "seq", "type_code", "msg_code",
-                      "sender_wxid", "sender_uid", "sender_uin", "is_from_me", "direction")
-            if any(key in old_raw and new_raw.get(key) != old_raw[key] for key in fields):
+            if not _same_source_record(selected, candidate):
                 result["warnings"].append("source message changed during media lookup; original record preserved")
             else:
-                candidate["record_id"] = selected["record_id"]
                 try:
-                    selected = merge_update(selected, candidate)
+                    selected = _merge_target_media(selected, candidate)
                 except ValueError:
                     result["warnings"].append("media identity mismatch; original record preserved")
     return {**result, "status": "ok", "message": selected}
@@ -202,33 +222,76 @@ async def context(args, fetch):
     located = await message({**args, "include_media": False}, fetch)
     if located["status"] != "ok":
         return located
-    target = located["message"]
-    neighbors, coverage = {}, {}
+    original_target = located["message"]
+    neighbors, coverage, verified_targets = {}, {}, []
     maximum = bounded(args.get("max_scan"), 20000, 1000000, "max_scan")
     for side, order, bound in (("before", "desc", "before"), ("after", "asc", "after")):
-        selected, seen = [], False
+        selected, candidates = [], []
+        seen, second_closed = False, False
         requested = counts[side + "_count"]
         window = dict(a)
-        window[bound] = str(target["timestamp"] + (1 if side == "before" else 0))
+        window[bound] = str(original_target["timestamp"] + (1 if side == "before" else 0))
         scan = Scan(window, fetch, maximum, order=order, media=args.get("include_media", True))
         if requested:
             async for row in scan.rows():
-                if matches_record_id(a["source"], row["chat_id"], row["original"], target["record_id"]):
+                if row["timestamp"] != original_target["timestamp"]:
+                    second_closed = True
+                if matches_record_id(a["source"], row["chat_id"], row["original"], original_target["record_id"]):
                     seen = True
-                    target = {**row, "record_id": target["record_id"],
-                              **({"base_record_id": target["base_record_id"]} if target.get("base_record_id") else {})}
-                elif seen:
+                    # Two candidates already prove ambiguity. Keep the bounded
+                    # evidence needed for the verdict, not an unbounded list.
+                    if len(candidates) < 2:
+                        candidates.append(row)
+                elif seen and len(selected) < requested:
                     selected.append(row)
-                    if len(selected) == requested:
-                        break
-        done = not requested or (scan.source_complete and not scan.error and (len(selected) == requested or (seen and scan.complete)))
-        coverage[side] = {**scan.coverage, "complete": done}
+                # Filling the requested neighbors is not enough: another
+                # target with the same native identity can follow in this same
+                # second or on its next page. Observe a second boundary first.
+                if second_closed and len(selected) >= requested:
+                    break
+        target_verified = not requested or (
+            (second_closed or scan.pagination_complete) and len(candidates) == 1
+            and _same_source_record(original_target, candidates[0]))
+        done = not requested or (scan.source_complete and not scan.error and target_verified
+                                and (len(selected) == requested or scan.complete))
+        side_warnings = list(scan.warnings)
+        if requested and not target_verified:
+            side_warnings.append("context target missing, ambiguous, changed, or not fully verified; original target preserved")
+        coverage[side] = {**scan.coverage, "complete": done, "target_verified": target_verified,
+                          "target_second_complete": second_closed or scan.pagination_complete,
+                          "warnings": side_warnings}
         neighbors[side] = list(reversed(selected)) if side == "before" else selected
+        if requested and target_verified:
+            verified_targets.append(candidates[0])
     complete = all(item["complete"] for item in coverage.values())
+    target = original_target
+    warnings = located.get("warnings", []) + [w for side in coverage.values() for w in side["warnings"]]
+    if complete:
+        before_identities = {(row["source"], row["chat_id"], row["record_id"], raw_fingerprint(row["original"]))
+                             for row in neighbors["before"]}
+        if any((row["source"], row["chat_id"], row["record_id"], raw_fingerprint(row["original"])) in before_identities
+               for row in neighbors["after"]):
+            complete = False
+            warnings.append("context order changed between passes; the same source record appeared on both sides")
+    if complete and args.get("include_media", True):
+        try:
+            for candidate in verified_targets:
+                target = _merge_target_media(target, candidate)
+        except ValueError:
+            complete = False
+            target = original_target
+            warnings.append("context media identity changed between passes; original target preserved")
+    if not complete:
+        # These neighbors were positioned against a target whose consistency
+        # was not established. Returning them as ordinary context is misleading.
+        neighbors = {"before": [], "after": []}
+        target = original_target
+        if not warnings:
+            warnings.append("context scan incomplete; original target preserved")
     return {"status": "ok" if complete else "partial", "target": target, **neighbors,
             "coverage": {"complete": complete, "sides": coverage,
                          "scanned": located["coverage"]["scanned"] + sum(c["scanned"] for c in coverage.values())},
-            "warnings": located.get("warnings", []) + [w for side in coverage.values() for w in side["warnings"]]}
+            "warnings": warnings}
 
 
 async def group_stats(args, fetch):
@@ -261,7 +324,8 @@ def tool_definitions():
     common = {"source": {"type": "string", "enum": ["wechat", "qq"]}, "chat_id": {"type": "string"},
               "chat_type": {"type": "string", "enum": ["private", "group", "discuss"]},
               "date": {"type": "string", "description": "Local +08:00 calendar date YYYY-MM-DD; conflicts with after/before"},
-              "after": {"type": "string"}, "before": {"type": "string"}}
+              "after": {"type": "string", "description": "Inclusive ISO/Unix start; a bare date means +08:00 midnight"},
+              "before": {"type": "string", "description": "Exclusive ISO/Unix end; a bare YYYY-MM-DD includes that entire local day"}}
     exact = {**common, "record_id": {"type": "string"}, "message_id": {"type": "string"},
              "max_scan": {"type": "integer", "minimum": 1, "maximum": 1000000, "default": 20000},
              "include_media": {"type": "boolean", "default": True}, "include_image_text": {"type": "boolean", "default": True}}

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — Scoped discovery and consistent context reads
+
+- Let chat discovery select WeChat, QQ or both and forward WeChat chat-type filters. Invalid/contradictory selectors fail before contacting a reader; unrequested platforms stay idle.
+- Centralize time parsing for unified and native QQ reads. Explicit empty dates/bounds, reversed ranges, ambiguous eight-digit dates and silently rounded fractional seconds are rejected. A valid future range clipped by the snapshot is still a legitimate empty interval.
+- Validate cursor structure before reading and reject invalid source timestamps instead of coercing booleans/floats into history order.
+- Revalidate the located context target across both read passes, including the complete target second. Changed/duplicate targets, scan-cap ambiguity and inconsistent bidirectional neighbors return partial with the original target preserved.
+- Expand server/tool guidance and add examples for person, group, date, all-history, keyword and media requests. These instructions and deterministic tests are not a measured LLM routing-accuracy claim.
+
 ## 0.3.1 — Identity and coverage hardening
 
 - Require exact QQ UID/UIN and owner-profile matches, reject conflicting selectors, and scope self-chat reads to the actual conversation. Unknown or contradictory sender identities remain unassigned.

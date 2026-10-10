@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wx-qq-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "Windows MCP gateway for local WeChat and QQ history, media and optional local speech recognition"
 readme = "README.md"
 requires-python = ">=3.12"

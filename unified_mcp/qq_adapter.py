@@ -234,6 +234,9 @@ install()
 
 def call(name, args):
     global _self_identity
+    if "after" in args or "before" in args:
+        from .time_scope import validate_time_range
+        validate_time_range(args.get("after"), args.get("before"))
     if name != "diagnose" and legacy.DEFAULT_DB_ROOT is None:
         raise RuntimeError("QQ is not configured. Set QQ_MCP_DB_ROOT to the intended account's nt_qq/nt_db directory; WeChat remains available.")
     token = SCOPE.set(args)

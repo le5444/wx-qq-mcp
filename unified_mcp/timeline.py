@@ -8,8 +8,8 @@ import hashlib
 import json
 
 from unified_mcp.read_contract import canonical_chat, page_source_complete, page_warnings, validate_record_chat, validated_page_projection
+from unified_mcp.time_scope import TZ, parse_time_bound, date_scope, message_timestamp
 
-TZ = dt.timezone(dt.timedelta(hours=8))
 
 
 def decoded_result(result):
@@ -65,18 +65,22 @@ def fingerprint(args):
 
 
 def read_cursor(cursor, args):
-    if not cursor:
+    if cursor is None:
         return {"v": 1, "scope": fingerprint(args), "offsets": {"wechat": 0, "qq": 0},
                 "snapshot_before": dt.datetime.now(TZ).isoformat(timespec="seconds")}
-    if len(cursor) > 8192:
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 8192:
         raise ValueError("Cursor too large")
     try:
         data = json.loads(base64.urlsafe_b64decode(cursor))
-        if data["v"] != 1 or data["scope"] != fingerprint(args):
+        if not isinstance(data, dict) or type(data.get("v")) is not int or data["v"] != 1 or data["scope"] != fingerprint(args):
             raise ValueError("Cursor belongs to a different query")
-        if any(type(v) is not int or v < 0 for v in data["offsets"].values()):
+        if not isinstance(data["offsets"], dict) or set(data["offsets"]) != {"wechat", "qq"} or any(type(v) is not int or v < 0 for v in data["offsets"].values()):
             raise ValueError("Invalid cursor offset")
-        dt.datetime.fromisoformat(data["snapshot_before"])
+        timestamp = dt.datetime.fromisoformat(data["snapshot_before"])
+        if timestamp.tzinfo is None:
+            raise ValueError("Cursor timestamp must include timezone")
+        if not isinstance(data.get("canonical_chats", {}), dict) or any(k not in {"wechat", "qq"} or not isinstance(v, str) or not v for k, v in data.get("canonical_chats", {}).items()):
+            raise ValueError("Invalid cursor canonical identities")
         return data
     except (ValueError, KeyError, TypeError) as exc:
         raise ValueError("Invalid or mismatched cursor") from exc
@@ -87,30 +91,14 @@ def write_cursor(data):
 
 
 def end_bound(value, snapshot):
-    end = dt.datetime.fromisoformat(snapshot)
-    if not value:
-        return str(int(end.timestamp()))
-    if value.isdigit():
-        n = int(value)
-        other = dt.datetime.fromtimestamp(n / 1000 if len(value) == 13 else n, TZ)
-    else:
-        other = dt.datetime.fromisoformat(value)
-        if len(value) == 10:
-            other += dt.timedelta(days=1)
-        if other.tzinfo is None:
-            other = other.replace(tzinfo=TZ)
-    return str(int(min(other, end).timestamp()))
+    end = parse_time_bound(snapshot)
+    other = parse_time_bound(value, before=True)
+    return str(end if other is None else min(other, end))
 
 
 def start_bound(value):
-    if not value:
-        return None
-    if value.isdigit():
-        return str(int(value) // 1000 if len(value) == 13 else int(value))
-    parsed = dt.datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=TZ)
-    return str(int(parsed.timestamp()))
+    parsed = parse_time_bound(value)
+    return str(parsed) if parsed is not None else None
 
 
 async def merged_timeline(args, fetch):
@@ -129,6 +117,11 @@ async def merged_timeline(args, fetch):
     if args.get("sender") and any(args.get(source + "_sender") for source in chats):
         raise ValueError("Use sender or a platform-specific sender, not both")
     state = read_cursor(args.get("cursor"), args)
+    start, end = start_bound(args.get("after")), end_bound(args.get("before"), state["snapshot_before"])
+    if start is not None and int(start) >= int(end):
+        return {"status": "ok", "messages": [], "returned": 0, "has_more": False, "next_cursor": None,
+                "snapshot_before": state["snapshot_before"], "sources": {}, "warnings": [],
+                "coverage": "The requested time range has no interval before the captured upper bound; no source read was needed."}
     pages, errors, pool = {}, {}, []
     for source, chat in chats.items():
         params = {"chat": chat, "contact": chat, "after": start_bound(args.get("after")),
@@ -168,7 +161,7 @@ async def merged_timeline(args, fetch):
                 msg = normal_message(source, row, canonical)
                 if msg["timestamp"] is None:
                     raise RuntimeError("Missing timestamp; cannot merge reliably")
-                timestamp = int(msg["timestamp"])
+                timestamp = message_timestamp(msg["timestamp"])
                 if ((params.get("after") and timestamp < int(params["after"])) or timestamp >= int(params["before"])):
                     raise RuntimeError("Backend returned a record outside the requested time range")
                 if previous_time is not None and ((order == "asc" and timestamp < previous_time) or (order == "desc" and timestamp > previous_time)):
@@ -202,18 +195,3 @@ async def merged_timeline(args, fetch):
             "has_more": more, "next_cursor": write_cursor(state) if more else None,
             "snapshot_before": state["snapshot_before"], "sources": metadata, "warnings": warnings,
             "coverage": "Local synchronized records only. This is a time-bounded live read, not an immutable DB snapshot; restart pagination after history migration."}
-
-
-def date_scope(args):
-    """Normalize a local calendar date without silently overriding a range."""
-    args = dict(args)
-    if args.get("date"):
-        if args.get("after") or args.get("before"):
-            raise ValueError("date cannot be combined with after/before")
-        value = args.pop("date")
-        day = dt.date.fromisoformat(value)
-        if len(value) != 10:
-            raise ValueError("date must be YYYY-MM-DD")
-        args["after"] = day.isoformat()
-        args["before"] = day.isoformat()
-    return args

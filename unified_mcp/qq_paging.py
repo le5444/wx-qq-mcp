@@ -64,6 +64,8 @@ class Reader:
     """One call owns its connections; never shares SQLite handles across threads."""
 
     def __init__(self, adapter, args):
+        from .time_scope import validate_time_range
+        validate_time_range(args.get("after"), args.get("before"))
         self.adapter, self.legacy, self.args = adapter, adapter.legacy, args
         self.main = self.fts = None
         self.warnings = []

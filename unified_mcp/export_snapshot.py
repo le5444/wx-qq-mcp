@@ -96,6 +96,8 @@ def _project_sources(db, output):
 
 
 async def export(options):
+    from unified_mcp.time_scope import validate_time_range
+    validate_time_range(getattr(options, 'after', None), getattr(options, 'before', None), end_date_inclusive=False)
     output = Path(options.output).resolve()
     with output_lock(output):
         return await _export_locked(options, output)
