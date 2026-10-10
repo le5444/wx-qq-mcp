@@ -26,8 +26,11 @@ from unified_mcp.timeline import decoded_result, merged_timeline
 from unified_mcp.media_validation import sanitize_media_payload
 from unified_mcp.voice_transcription import VoiceService
 from unified_mcp.image_text import ImageTextReader, image_reference_rank
+from unified_mcp.version import VERSION
+from unified_mcp import analysis_tools
 
 BASE = Path(__file__).resolve().parent
+INSTRUCTIONS = "wx-mcp exposes BOTH WeChat and QQ. Original unprefixed tools are WeChat; qq_* tools are QQ; unified_* read both. Resolve stable chat identities before reading. Never infer senders or equate matching nicknames. Page until has_more is false. Use unified_message/context for exact records and unified_group_stats for factual counts. Report partial scans, unavailable media and unsynchronized history explicitly. No message-sending tools are provided."
 
 
 def text_result(data, error=False):
@@ -43,6 +46,8 @@ class Gateway:
         )
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qq-reader")
         self.qq = None
+        self._qq_pending = 0
+        self._qq_limit = 32
         self.voice = VoiceService()
         self.image_text = None
         self.wechat_tools = [types.Tool.model_validate(t) for t in json.loads((BASE / "wechat_legacy_tools.json").read_text(encoding="utf-8"))]
@@ -77,7 +82,16 @@ class Gateway:
             if result.structuredContent is not None:
                 updates["structuredContent"] = await self._optional_enrichment(result.structuredContent, name, args, include_image_text)
             return result.model_copy(update=updates)
-        result = await asyncio.get_running_loop().run_in_executor(self.executor, self._qq_call, name, args)
+        if self._qq_pending >= self._qq_limit:
+            raise RuntimeError("QQ reader queue is full; retry after pending requests finish")
+        self._qq_pending += 1
+        work = asyncio.get_running_loop().run_in_executor(self.executor, self._qq_call, name, args)
+        def finished(future):
+            self._qq_pending -= 1
+            if not future.cancelled():
+                future.exception()  # Observe errors if the requesting client left.
+        work.add_done_callback(finished)
+        result = await asyncio.shield(work)
         if include_image_text and args.get("include_media", True):
             try:
                 return await self._image_text_payload(result)
@@ -243,6 +257,8 @@ class Gateway:
             "qq_chat": {"type": "string", "description": "Resolved QQ contact UID/UIN or group ID"},
             "qq_chat_type": {"type": "string", "enum": ["private", "group", "discuss"], "default": "private"},
             "after": {"type": "string"}, "before": {"type": "string"}, "keyword": {"type": "string"},
+            "date": {"type": "string", "description": "YYYY-MM-DD in +08:00; cannot be combined with after/before"},
+            "sender": {"type": "string"}, "kind_name": {"type": "string"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
             "order": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
             "cursor": {"type": "string"}, "include_media": {"type": "boolean", "default": True},
@@ -257,6 +273,8 @@ class Gateway:
         tools.append(types.Tool(name="unified_sources", description="Diagnose local WeChat/QQ readiness and lazy-process state; never returns keys.", inputSchema={"type": "object", "properties": {}, "additionalProperties": False}))
         tools.append(types.Tool(name="unified_resolve_chat", description="Find candidates in both platforms; never automatically equate people by nickname.", inputSchema={"type": "object", "properties": {"query": {"type": "string"}, "qq_chat_type": {"enum": ["private", "group"], "type": "string"}}, "required": ["query"], "additionalProperties": False}))
         tools.append(types.Tool(name="unified_read_image", description="Read a local WeChat/QQ image or sticker: returns local OCR text and an image preview for visual understanding. Animated previews show the first frame only; original path is preserved.", inputSchema={"type": "object", "properties": {"path": {"type": "string"}, "include_image": {"type": "boolean", "default": True}}, "required": ["path"], "additionalProperties": False}))
+        tools.extend(analysis_tools.tool_definitions())
+        tools.append(types.Tool(name="unified_health", description="Fast process and queue diagnostics without opening databases or loading speech/OCR models. This is not a deep data-readiness check.", inputSchema={"type": "object", "properties": {}, "additionalProperties": False}))
         return tools
 
     async def call(self, name, args):
@@ -264,17 +282,48 @@ class Gateway:
             if name == "unified_read_image":
                 if self.image_text is None:
                     self.image_text = ImageTextReader()
-                result = await asyncio.to_thread(self.image_text.read, args["path"])
-                response = text_result({"path": args["path"], "ocr": result}, error=result.get("status") == "unavailable")
-                if args.get("include_image", True) and result.get("status") in {"ok", "no_text"}:
+                try:
+                    result = await asyncio.to_thread(self.image_text.read, args["path"])
+                except Exception as exc:
+                    result = {"status": "unavailable", "error": type(exc).__name__}
+                def decode_preview():
                     from PIL import Image
-                    with Image.open(args["path"]) as source_image:
+                    from unified_mcp.media_validation import _local_path, _read_local_image, _decode_bytes
+                    raw, failure = _read_local_image(_local_path(args["path"]))
+                    verdict = failure or _decode_bytes(raw)
+                    if not verdict["valid"]:
+                        raise ValueError(verdict["status"])
+                    with Image.open(io.BytesIO(raw)) as source_image:
+                        animated = getattr(source_image, "n_frames", 1) > 1
+                        source_image.seek(0)
                         preview = source_image.convert("RGB")
                         preview.thumbnail((1600, 1600))
                         buffer = io.BytesIO()
                         preview.save(buffer, format="JPEG", quality=90)
-                    response.content.append(types.ImageContent(type="image", mimeType="image/jpeg", data=base64.b64encode(buffer.getvalue()).decode()))
+                    return buffer.getvalue(), animated
+                try:
+                    data, animated = await asyncio.to_thread(decode_preview)
+                except Exception as exc:
+                    return text_result({"path": args["path"], "ocr": result, "status": "unavailable", "error": "Image could not be decoded: " + type(exc).__name__}, error=True)
+                payload = {"path": args["path"], "ocr": result, "status": "ok",
+                           "preview": "first_frame_only" if animated else "static_image", "animated": animated}
+                if result.get("status") not in {"ok", "no_text"}:
+                    payload["warnings"] = ["OCR unavailable; the decoded image remains viewable"]
+                response = text_result(payload)
+                if args.get("include_image", True):
+                    response.content.append(types.ImageContent(type="image", mimeType="image/jpeg", data=base64.b64encode(data).decode()))
                 return response
+            if name == "unified_health":
+                return text_result({"version": VERSION, "pid": os.getpid(), "check": "fast_process_state",
+                                    "wechat": self.wechat.status(), "qq_initialized": self.qq is not None,
+                                    "qq_pending": self._qq_pending, "qq_queue_limit": self._qq_limit,
+                                    "ocr_initialized": self.image_text is not None,
+                                    "voice": self.voice.status() if hasattr(self.voice, "status") else {"initialized": True},
+                                    "note": "Does not prove database access, media completeness or transcript accuracy"})
+            if name in {"unified_message", "unified_context", "unified_group_stats"}:
+                function = getattr(analysis_tools, name.removeprefix("unified_"))
+                result = await function(args, self.fetch)
+                return text_result(result, error=result["status"] == "partial")
             if name == "unified_sources":
                 try:
                     qq = await self.fetch("qq", "diagnose", {})
@@ -305,18 +354,27 @@ class Gateway:
             return text_result({"error": str(exc), "tool": name}, error=True)
 
     async def close(self):
-        try:
-            await self.wechat.close()
-        finally:
-            await self.voice.close()
-            if self.image_text is not None:
+        errors = []
+        for component in (self.wechat, self.voice):
+            try:
+                await component.close()
+            except Exception as exc:
+                errors.append(exc)
+        if self.image_text is not None:
+            try:
                 await asyncio.to_thread(self.image_text.close)
+            except Exception as exc:
+                errors.append(exc)
         def cleanup():
             if self.qq and self.qq.legacy._VFS_CONNECTION:
                 self.qq.legacy._VFS_CONNECTION.close()
                 self.qq.legacy._VFS_CONNECTION = None
-        await asyncio.get_running_loop().run_in_executor(self.executor, cleanup)
-        self.executor.shutdown(wait=True)
+        try:
+            await asyncio.get_running_loop().run_in_executor(self.executor, cleanup)
+        finally:
+            self.executor.shutdown(wait=True)
+        if errors:
+            raise ExceptionGroup("Gateway cleanup errors", errors)
 
 
 async def serve():
@@ -327,8 +385,7 @@ async def serve():
             yield {}
         finally:
             await gateway.close()
-    server = Server("wx-mcp-unified", version="0.2.1", lifespan=lifespan,
-                    instructions="wx-mcp now exposes BOTH WeChat and QQ. Original unprefixed tools are WeChat; qq_* tools are QQ; unified_* read both. Do not infer senders or assume matching nicknames are the same person. Page until has_more is false. Report errors, unavailable media and unsynchronized history explicitly. No message-sending tools are provided.")
+    server = Server("wx-mcp-unified", version=VERSION, lifespan=lifespan, instructions=INSTRUCTIONS)
     @server.list_tools()
     async def list_tools():
         return gateway.tools()
@@ -352,12 +409,20 @@ async def cli_call(name, args):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser()
+    parser.add_argument("--shared", action="store_true", help="Use one authenticated local daemon across MCP clients")
     parser.add_argument("--call")
     parser.add_argument("--args", default="{}")
     options = parser.parse_args()
     if options.call:
         return asyncio.run(cli_call(options.call, json.loads(options.args)))
+    if options.shared:
+        from unified_mcp.shared_service import serve_shared_bridge
+        asyncio.run(serve_shared_bridge(version=VERSION, instructions=INSTRUCTIONS))
+        return 0
     asyncio.run(serve())
     return 0
 

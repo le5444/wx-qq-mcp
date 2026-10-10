@@ -44,7 +44,7 @@ async def main():
         await gateway.close()
 asyncio.run(main())
 ''')
-        self.assertEqual(value, {"count": 40, "unique": 40})
+        self.assertEqual(value, {"count": 44, "unique": 44})
         self.assertFalse(wrote)
 
     def test_all_default_gateway_caches_live_outside_the_package(self):

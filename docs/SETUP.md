@@ -50,7 +50,15 @@ $env:QQ_MCP_EXTENSION = 'C:/path/to/sqlite_ext_ntqq_db.dll'
 
 `examples/codex.toml` 和 `examples/claude.mcp.json` 使用相同的 Python 模块入口。必须把示例路径改为自己的安装位置；QQ 不使用时可移除相关环境变量。
 
-启用统一入口后，原来独立的 QQ MCP 可以在客户端配置中停用，避免重复工具与后台进程。多个客户端同时运行仍可能各自启动一个网关；共享后台属于尚未完成的优化。
+启用统一入口后，原来独立的 QQ MCP 可以在客户端配置中停用，避免重复工具与后台进程。默认 stdio 模式仍各自启动网关。0.3.0 Alpha 可在两个客户端的模块参数末尾增加 `--shared`，使用同用户、同 Python/代码/配置的共享后台：
+
+```toml
+args = ['-X', 'utf8', '-m', 'unified_mcp.server', '--shared']
+```
+
+启动时自动连接或创建当前用户的本机回环服务；每个客户端仍有自己的 stdio 桥。配置或代码不同会创建隔离实例。令牌目录受当前用户权限保护，无需手动复制令牌到客户端配置。首次启用建议两个客户端同时查询，然后关闭其中一个，核对另一个仍可查询；共享模式的多机器、长时运行验收仍在完善。实例隔离、私有目录、取消与恢复的细节见 [SHARED_SERVICE.md](SHARED_SERVICE.md)。
+
+更新代码后需重连相关客户端。后台没有活跃客户端后默认空闲 120 秒退出，可用 `WXQQ_SHARED_IDLE_SECONDS` 调整。配置一致不等于当前已经打开的旧进程自动迁移。
 
 ## 5. 可选本地语音
 
@@ -75,6 +83,7 @@ FFmpeg 独立安装，FFprobe 可选。首帧解码验证需要 FFmpeg，只有 
 | `WXQQ_DATA_DIR` | Python 网关数据目录；默认 `%LOCALAPPDATA%/wx-qq-mcp` |
 | `UNIFIED_WECHAT_COMMAND` / `UNIFIED_WECHAT_ARGS` | 外部微信读取器与参数数组 |
 | `UNIFIED_IDLE_SECONDS` | 微信子进程空闲退出时间，默认 60 |
+| `WXQQ_SHARED_IDLE_SECONDS` | 共享后台没有会话时的空闲退出时间，默认 120 秒 |
 | `QQ_MCP_DB_ROOT` | 明确选择的 QQ 账号数据库目录 |
 | `QQ_MCP_EXTENSION` | 外置 NTQQ VFS 扩展 DLL |
 | `QQ_MCP_DATA_ROOT` | QQ 媒体数据目录，默认从数据库目录推导 |
@@ -90,3 +99,5 @@ FFmpeg 独立安装，FFprobe 可选。首帧解码验证需要 FFmpeg，只有 
 | `UNIFIED_FFMPEG` / `UNIFIED_FFPROBE` | 视频处理程序路径 |
 
 `WXQQ_DATA_DIR` 不接管外部微信核心自己的缓存。导出命令的 `--output` 也是独立的显式路径。
+
+完整导出和媒体阅读可运行 `python -X utf8 -m unified_mcp.workflow`；参数、断点恢复、QQ群和便携包示例见 [WORKFLOW.md](WORKFLOW.md)。快速排障先调用 `unified_health`，再执行一个明确授权的小窗口查询；快速检查不会自行加载模型。

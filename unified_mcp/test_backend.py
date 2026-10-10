@@ -200,6 +200,34 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         await backend.close()
         self.assertFalse(process_exists(pid))
 
+    async def test_active_cancel_recycles_blocked_reader_and_unblocks_other_client(self):
+        backend = self.backend(timeout_seconds=30)
+        first = await backend.call("status", {})
+        first_pid = json.loads(first.content[0].text)["pid"]
+        received = Path(self.directory.name) / "active-cancel-received"
+        running = asyncio.create_task(backend.call("hang", {"received": str(received)}))
+        await until(received.exists)
+        waiting = asyncio.create_task(backend.call("status", {}))
+        running.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await running
+        result = await asyncio.wait_for(waiting, 5)
+        self.assertNotEqual(json.loads(result.content[0].text)["pid"], first_pid)
+        self.assertFalse(process_exists(first_pid))
+
+    async def test_queue_overload_is_bounded_and_reported(self):
+        backend = self.backend(timeout_seconds=30, queue_limit=1)
+        await backend.call("status", {})
+        received = Path(self.directory.name) / "queue-full-received"
+        running = asyncio.create_task(backend.call("hang", {"received": str(received)}))
+        await until(received.exists)
+        pending = asyncio.create_task(backend.call("status", {}))
+        await until(lambda: backend.queue.qsize() == 1)
+        with self.assertRaisesRegex(RuntimeError, "queue is full"):
+            await backend.call("status", {})
+        await backend.close()
+        await asyncio.gather(running, pending, return_exceptions=True)
+
     async def test_shutdown_deadline_is_not_extended_by_unresponsive_cleanup(self):
         backend = self.backend(shutdown_timeout_seconds=.05)
         release = asyncio.Event()

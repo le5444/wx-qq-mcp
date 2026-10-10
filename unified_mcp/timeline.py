@@ -52,7 +52,7 @@ def normal_message(source, row, chat):
 
 
 def fingerprint(args):
-    scope = {k: args.get(k) for k in ("wechat_chat", "qq_chat", "qq_chat_type", "after", "before", "keyword", "order", "include_media", "include_image_text")}
+    scope = {k: args.get(k) for k in ("wechat_chat", "qq_chat", "qq_chat_type", "date", "after", "before", "keyword", "sender", "kind_name", "order", "include_media", "include_image_text")}
     return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
 
 
@@ -106,6 +106,7 @@ def start_bound(value):
 
 
 async def merged_timeline(args, fetch):
+    args = date_scope(args)
     chats = {source: args.get(source + "_chat") for source in ("wechat", "qq") if args.get(source + "_chat")}
     if not chats:
         raise ValueError("Specify wechat_chat and/or qq_chat using resolved stable IDs")
@@ -120,7 +121,8 @@ async def merged_timeline(args, fetch):
     for source, chat in chats.items():
         params = {"chat": chat, "contact": chat, "after": start_bound(args.get("after")),
                   "before": end_bound(args.get("before"), state["snapshot_before"]),
-                  "keyword": args.get("keyword"), "limit": limit + 1,
+                  "keyword": args.get("keyword"), "sender": args.get("sender"),
+                  "kind_name": args.get("kind_name"), "limit": limit + 1,
                   "offset": state["offsets"].get(source, 0), "order": order,
                   "display_order": order}
         if source == "qq":
@@ -140,13 +142,27 @@ async def merged_timeline(args, fetch):
                 raise RuntimeError(str(page["errors"]))
             if not isinstance(page.get("messages"), list):
                 raise RuntimeError("Backend omitted messages")
+            if not page["messages"] and page.get("query", {}).get("has_more"):
+                raise RuntimeError("Backend returned an empty nonterminal page; pagination cannot advance safely")
             if any(m.get("error") for m in page["messages"]):
                 raise RuntimeError("Some records failed to read; inspect the native source tool")
             pages[source] = page
+            if type(page.get("query", {}).get("has_more")) is not bool:
+                raise RuntimeError("Backend omitted an explicit pagination endpoint")
+            previous_time = None
             for index, row in enumerate(page["messages"]):
+                native_chat = (row.get("talker") or (row.get("id") or {}).get("talker")) if source == "wechat" else row.get("chat_id")
+                if native_chat and str(native_chat) != chat:
+                    raise RuntimeError("Backend returned a record from another chat")
                 msg = normal_message(source, row, chat)
                 if msg["timestamp"] is None:
                     raise RuntimeError("Missing timestamp; cannot merge reliably")
+                timestamp = int(msg["timestamp"])
+                if ((params.get("after") and timestamp < int(params["after"])) or timestamp >= int(params["before"])):
+                    raise RuntimeError("Backend returned a record outside the requested time range")
+                if previous_time is not None and ((order == "asc" and timestamp < previous_time) or (order == "desc" and timestamp > previous_time)):
+                    raise RuntimeError("Backend did not respect requested time order")
+                previous_time = timestamp
                 # Index preserves the backend's ordering for same-second messages.
                 pool.append((source, index, msg))
         except Exception as exc:
@@ -170,3 +186,18 @@ async def merged_timeline(args, fetch):
             "has_more": more, "next_cursor": write_cursor(state) if more else None,
             "snapshot_before": state["snapshot_before"], "sources": metadata, "warnings": warnings,
             "coverage": "Local synchronized records only. This is a time-bounded live read, not an immutable DB snapshot; restart pagination after history migration."}
+
+
+def date_scope(args):
+    """Normalize a local calendar date without silently overriding a range."""
+    args = dict(args)
+    if args.get("date"):
+        if args.get("after") or args.get("before"):
+            raise ValueError("date cannot be combined with after/before")
+        value = args.pop("date")
+        day = dt.date.fromisoformat(value)
+        if len(value) != 10:
+            raise ValueError("date must be YYYY-MM-DD")
+        args["after"] = day.isoformat()
+        args["before"] = day.isoformat()
+    return args
