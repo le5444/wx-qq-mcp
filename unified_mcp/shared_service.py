@@ -137,7 +137,12 @@ def configuration_fingerprint(env=None, *, factory=DEFAULT_FACTORY):
     for path in paths:
         if path.is_file():
             settings.append((str(path.resolve()), hashlib.sha256(path.read_bytes()).hexdigest()))
-    scope = {"root": str(ROOT.resolve()), "python": str(Path(sys.executable).resolve()),
+    executable = Path(sys.executable).resolve()
+    # Daemon bootstrap uses pythonw to avoid the console venv launcher. Both
+    # names in the same installation refer to one environment/profile.
+    if os.name == "nt" and executable.name.lower() == "pythonw.exe":
+        executable = executable.with_name("python.exe")
+    scope = {"root": str(ROOT.resolve()), "python": str(executable),
              "implementation": implementation_digest(), "env": selected, "settings": settings, "factory": factory}
     return hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()
 

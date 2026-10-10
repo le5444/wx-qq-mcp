@@ -45,6 +45,8 @@ Windows MCP SDK 会给 stdio 客户端进程设置关闭时结束子进程的 Jo
 
 短暂的 PowerShell 启动器使用 `CREATE_NO_WINDOW`；WMI 后台使用 `DETACHED_PROCESS` 和 `ShowWindow=0`，不连接父控制台。本机 WMI provider 对 `CREATE_NO_WINDOW` 返回参数错误 21，而文档列出的 `DETACHED_PROCESS` 已通过实际启动验证，所以不能只照搬 `CreateProcess` 的标志。[WMI 启动配置](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processstartup)
 
+0.3.3修复了这一方案在Python虚拟环境下的遗漏：普通`python.exe`启动器还会创建基础解释器进程，不一定保留隐藏/分离控制台标志，可能弹出空白终端。因此后台bootstrap改用同一环境的`pythonw.exe`，从可执行文件类型上不创建控制台；stdio桥仍使用`python.exe`保留协议流。两种解释器在同一环境中归一到相同配置指纹；缺失`pythonw.exe`时明确失败，不退回会弹窗的后台启动方式。
+
 完整环境通过同一私有 ACL 目录下的一次性 bootstrap JSON 传递，命令行只带 bootstrap 文件路径。后台先恢复环境、重定向到私有日志并删除 handoff，再导入服务，避免模型、账号或缓存配置丢失。WMI 创建失败会报告安全的状态码或异常类型，不回退到已知会继承 Job 的启动方式，也不会输出环境值。WMI 服务或命名空间被系统策略禁用时，共享模式会明确失败；管理员需恢复本机 WMI 权限，或在独立终端预启动后台。
 
 ## 本次验证范围

@@ -81,6 +81,21 @@ if ($createdProcess.ReturnValue -ne 0) { [Console]::Error.WriteLine('WXQQ_WMI_ST
 """
 
 
+def windowless_python(executable=None):
+    """The venv console launcher does not preserve detached creation flags.
+
+    Use the GUI-subsystem launcher and its GUI base interpreter for daemon
+    bootstrap only. Stdio bridges still require their ordinary Python streams.
+    """
+    path = Path(executable or sys.executable)
+    if path.name.lower() not in {"python.exe", "pythonw.exe"}:
+        raise RuntimeError("Shared Windows daemon requires a standard Python installation with pythonw.exe")
+    candidate = path.with_name("pythonw.exe")
+    if not candidate.is_file():
+        raise RuntimeError("Windowless pythonw.exe is missing; refusing a console-producing daemon fallback")
+    return candidate
+
+
 def launch_detached(command, *, directory, cwd):
     if os.name != "nt":
         raise RuntimeError("WMI shared launch is only available on Windows")
@@ -88,7 +103,7 @@ def launch_detached(command, *, directory, cwd):
     bootstrap = Path(__file__).with_name("shared_bootstrap.py")
     fd, filename = tempfile.mkstemp(prefix="bootstrap-", suffix=".json", dir=directory)
     handoff = Path(filename)
-    child_command = [sys.executable, "-X", "utf8", str(bootstrap), str(handoff)]
+    child_command = [str(windowless_python()), "-X", "utf8", str(bootstrap), str(handoff)]
     config = {"command_line": subprocess.list2cmdline(child_command), "cwd": str(cwd),
               "package_root": str(Path(__file__).resolve().parent.parent), "env": dict(os.environ),
               "log": str(directory / "daemon.log"), "daemon_args": command[5:]}

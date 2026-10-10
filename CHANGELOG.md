@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 — Windowless Windows daemon startup
+
+- Use the same environment's `pythonw.exe` for shared-daemon bootstrap. A console venv launcher can spawn its base interpreter without preserving WMI hidden/detached flags and open an empty Windows Terminal window.
+- Normalize `python.exe` and `pythonw.exe` within the same environment for profile identity. Stdio bridges retain console Python and their protocol streams; only the detached daemon is windowless.
+- Refuse to fall back to a console daemon if `pythonw.exe` is missing. Add Windows process-level checks for absence of a console, protocol health, identity reuse and shutdown.
+
 ## 0.3.2 — Scoped discovery and consistent context reads
 
 - Let chat discovery select WeChat, QQ or both and forward WeChat chat-type filters. Invalid/contradictory selectors fail before contacting a reader; unrequested platforms stay idle.
