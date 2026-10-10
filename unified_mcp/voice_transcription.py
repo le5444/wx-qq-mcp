@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
@@ -441,19 +442,75 @@ def attach_transcript(node: dict, transcript: dict) -> dict:
 
 
 class VoiceService:
-    """Bounded serialized subprocess; ASR dependencies stay outside gateway env."""
+    """One worker, bounded distinct jobs and shared content-addressed requests.
 
-    def __init__(self, python: Path = PYTHON, timeout_seconds: float = 180, idle_seconds: float = 60):
+Canceling one client detaches only that waiter. The actual inference is canceled
+when its final waiter leaves, or when the owning service explicitly closes.
+"""
+
+    def __init__(self, python: Path = PYTHON, timeout_seconds: float = 180, idle_seconds: float = 60,
+                 max_pending: int = 8, max_waiters: int = 128):
         self.python = Path(python)
         self.timeout_seconds = timeout_seconds
         self.idle_seconds = idle_seconds
         if min(timeout_seconds, idle_seconds) <= 0:
             raise ValueError("Voice service timeouts must be positive")
+        if type(max_pending) is not int or not 1 <= max_pending <= 128:
+            raise ValueError("max_pending must be between 1 and 128")
+        if type(max_waiters) is not int or not 1 <= max_waiters <= 4096:
+            raise ValueError("max_waiters must be between 1 and 4096")
+        self.max_pending, self.max_waiters = max_pending, max_waiters
         self.process = None
         self.lock = asyncio.Lock()
         self.closed = False
         self.idle_task = None
         self.last_used = time.monotonic()
+        self._inflight = {}
+        self._waiters = {}
+        self._requests = 0
+        self._active_key = None
+        self._deduplicated = 0
+        self._cache_hits = 0
+        self._completed = 0
+        # Content hashing and cache reads are serialized independently of ASR.
+        # A burst of requests cannot allocate MAX_AUDIO_BYTES per caller.
+        self._identity_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-identity")
+
+    def status(self):
+        """Cheap status only: never read audio, load a model, or expose paths."""
+        jobs = sum(not task.done() for task in self._inflight.values())
+        active = int(self._active_key is not None)
+        return {"closed": self.closed,
+                "worker_running": self.process is not None and self.process.returncode is None,
+                "inflight_jobs": jobs, "active_jobs": active, "queued_jobs": max(0, jobs - active),
+                "request_waiters": self._requests, "max_pending": self.max_pending,
+                "max_waiters": self.max_waiters, "deduplicated_requests": self._deduplicated,
+                "cache_hits": self._cache_hits, "completed_jobs": self._completed}
+
+    @staticmethod
+    def _unavailable(error_type):
+        return {"status": "unavailable", "retryable": True, "automatic": True,
+                "engine": "local-asr-worker", "error_type": error_type}
+
+    @staticmethod
+    def _prepare(path):
+        data = read_audio(path)
+        whisper, audio_hash = cache_identity(data)
+        sense, _ = sense_cache_identity(data)
+        # Model revisions and selected engine participate, as in durable caches.
+        key = audio_hash + ":" + hashlib.sha256((whisper + sense + os.environ.get("WX_UNIFIED_ASR_ENGINE", "auto")).encode()).hexdigest()
+        del data
+        cached = cached_transcript(path)
+        if cached and cached.get("audio_sha256") not in (None, audio_hash):
+            raise ValueError("Audio changed during cache lookup")
+        return key, cached
+
+    def _finished(self, key, task):
+        if self._inflight.get(key) is task:
+            self._inflight.pop(key, None)
+        # Retrieve exceptions even when the last waiter has disconnected.
+        if not task.cancelled():
+            task.exception()
 
     def _start_idle_watch(self):
         if self.idle_task is None or self.idle_task.done():
@@ -485,41 +542,101 @@ class VoiceService:
 
     async def transcribe(self, path: str | Path) -> dict:
         if self.closed:
-            return {"status": "unavailable", "retryable": True, "error_type": "ServiceClosed"}
-        cached = await asyncio.to_thread(cached_transcript, path)
-        if cached:
-            return cached
-        async with self.lock:
+            return self._unavailable("ServiceClosed")
+        if self._requests >= self.max_waiters:
+            return self._unavailable("QueueFull")
+        self._requests += 1
+        key = task = None
+        joined = False
+        try:
             try:
-                if self.closed:
-                    raise RuntimeError("Local voice service is closed")
-                self.last_used = time.monotonic()
-                if self.process is None or self.process.returncode is not None:
-                    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                    self.process = await asyncio.create_subprocess_exec(
-                        str(self.python), str(Path(__file__).resolve()), "--worker",
-                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.DEVNULL, creationflags=flags, limit=1024*1024,
-                        env={**os.environ, "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"})
-                    if self.closed:
-                        await self._stop()
-                        raise RuntimeError("Local voice service is closed")
-                    self._start_idle_watch()
-                self.process.stdin.write((json.dumps({"audio_path": str(path)}, ensure_ascii=True) + "\n").encode())
-                await self.process.stdin.drain()
-                response = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.timeout_seconds)
-                if not response:
-                    raise RuntimeError("Local voice worker exited")
-                return json.loads(response)
+                key, cached = await asyncio.get_running_loop().run_in_executor(self._identity_executor, self._prepare, path)
+            except Exception as exc:
+                return self._unavailable("ServiceClosed" if self.closed else type(exc).__name__)
+            if self.closed:
+                return self._unavailable("ServiceClosed")
+            if cached:
+                self._cache_hits += 1
+                return cached
+            task = self._inflight.get(key)
+            if task is not None and task.done():
+                self._inflight.pop(key, None)
+                task = None
+            if task is None:
+                if len(self._inflight) >= self.max_pending:
+                    return self._unavailable("QueueFull")
+                task = asyncio.create_task(self._run_job(key, path))
+                self._inflight[key] = task
+                task.add_done_callback(lambda completed, job_key=key: self._finished(job_key, completed))
+            else:
+                self._deduplicated += 1
+            self._waiters[key] = self._waiters.get(key, 0) + 1
+            joined = True
+            return copy.deepcopy(await asyncio.shield(task))
+        finally:
+            self._requests -= 1
+            if joined:
+                remaining = self._waiters.get(key, 1) - 1
+                if remaining:
+                    self._waiters[key] = remaining
+                else:
+                    self._waiters.pop(key, None)
+                    if not task.done():
+                        if self._inflight.get(key) is task:
+                            self._inflight.pop(key, None)
+                        task.cancel()
+
+    async def _run_job(self, key, path):
+        async with self.lock:
+            self._active_key = key
+            try:
+                # An independent worker/process may have completed this audio
+                # while this job was queued; successful cache data wins.
+                current_key, cached = await asyncio.get_running_loop().run_in_executor(self._identity_executor, self._prepare, path)
+                if current_key != key:
+                    return self._unavailable("AudioChanged")
+                if cached:
+                    self._cache_hits += 1
+                    return cached
+                result = await self._transcribe_locked(path)
+                self._completed += 1
+                if result.get("audio_sha256") and result["audio_sha256"] != key.split(":", 1)[0]:
+                    return self._unavailable("AudioChanged")
+                return result
             except asyncio.CancelledError:
                 await self._stop()
                 raise
             except Exception as exc:
                 await self._stop()
-                return {"status": "unavailable", "engine": "faster-whisper-local", "automatic": True,
-                        "retryable": True, "error_type": type(exc).__name__}
+                return self._unavailable(type(exc).__name__)
             finally:
+                self._active_key = None
                 self.last_used = time.monotonic()
+
+    async def _transcribe_locked(self, path):
+        if self.closed:
+            raise RuntimeError("Local voice service is closed")
+        self.last_used = time.monotonic()
+        if self.process is None or self.process.returncode is not None:
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.process = await asyncio.create_subprocess_exec(
+                str(self.python), str(Path(__file__).resolve()), "--worker",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL, creationflags=flags, limit=1024*1024,
+                env={**os.environ, "HF_HUB_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1"})
+            if self.closed:
+                await self._stop()
+                raise RuntimeError("Local voice service is closed")
+            self._start_idle_watch()
+        self.process.stdin.write((json.dumps({"audio_path": str(path)}, ensure_ascii=True) + "\n").encode())
+        await self.process.stdin.drain()
+        response = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.timeout_seconds)
+        if not response:
+            raise RuntimeError("Local voice worker exited")
+        result = json.loads(response)
+        if not isinstance(result, dict) or result.get("status") not in {"ok", "no_speech", "unavailable", "audio_missing"}:
+            raise RuntimeError("Local voice worker returned an invalid result")
+        return result
 
     async def enrich(self, payload, transcribe: bool = True):
         if isinstance(payload, list):
@@ -537,8 +654,14 @@ class VoiceService:
 
     async def close(self):
         self.closed = True
+        pending = list(self._inflight.values())
+        for task in pending:
+            task.cancel()
         # Closing must not queue behind a slow ASR inference holding the lock.
         await self._stop()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._identity_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def run_batch(input_path: Path, output_path: Path, summary_path: Path, limit: int | None = None):

@@ -20,7 +20,7 @@ def error_detail(exc):
 
 class WeChatBackend:
     def __init__(self, command=None, args=None, idle_seconds=60, timeout_seconds=120,
-                 shutdown_timeout_seconds=5, startup_timeout_seconds=None):
+                 shutdown_timeout_seconds=5, startup_timeout_seconds=None, queue_limit=64):
         startup_timeout_seconds = timeout_seconds if startup_timeout_seconds is None else startup_timeout_seconds
         if min(idle_seconds, timeout_seconds, shutdown_timeout_seconds, startup_timeout_seconds) <= 0:
             raise ValueError("Backend timeouts must be positive")
@@ -30,7 +30,9 @@ class WeChatBackend:
         self.timeout_seconds = timeout_seconds
         self.startup_timeout_seconds = startup_timeout_seconds
         self.shutdown_timeout_seconds = shutdown_timeout_seconds
-        self.queue = asyncio.Queue()
+        if type(queue_limit) is not int or queue_limit < 1:
+            raise ValueError("queue_limit must be a positive integer")
+        self.queue = asyncio.Queue(maxsize=queue_limit)
         self.task = None
         self.active = False
         self.starts = 0
@@ -38,10 +40,16 @@ class WeChatBackend:
         self._closed = False
         self._closing = None
         self._requests = set()
+        self.completed = 0
+        self.failures = 0
+        self.cancelled = 0
+        self.last_error = None
 
     async def call(self, name, arguments):
         if self._closed:
             raise RuntimeError("WeChat backend is closed")
+        if self.queue.full():
+            raise RuntimeError("WeChat reader queue is full; retry after pending requests finish")
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._worker())
         future = asyncio.get_running_loop().create_future()
@@ -79,17 +87,35 @@ class WeChatBackend:
                                     # The SDK's read timeout does not cover sending
                                     # to a child whose stdin is blocked.
                                     async with asyncio.timeout(self.timeout_seconds):
-                                        result = await client.call_tool(
-                                            name, arguments,
-                                            read_timeout_seconds=dt.timedelta(seconds=self.timeout_seconds))
+                                        rpc = asyncio.create_task(client.call_tool(name, arguments,
+                                            read_timeout_seconds=dt.timedelta(seconds=self.timeout_seconds)))
+                                        def cancel_rpc(done, running=rpc):
+                                            if done.cancelled():
+                                                running.cancel()
+                                        future.add_done_callback(cancel_rpc)
+                                        try:
+                                            result = await rpc
+                                        except asyncio.CancelledError:
+                                            if asyncio.current_task().cancelling():
+                                                raise
+                                            self.cancelled += 1
+                                            # A reader may ignore the MCP cancel
+                                            # notification. Recycle our child so
+                                            # its blocking read cannot strand B.
+                                            raise RuntimeError("Active request cancelled; reader will restart")
+                                        finally:
+                                            future.remove_done_callback(cancel_rpc)
                                     if not future.done():
                                         future.set_result(result)
+                                        self.completed += 1
                                 item = None
                                 try:
                                     item = await asyncio.wait_for(self.queue.get(), timeout=self.idle_seconds)
                                 except asyncio.TimeoutError:
                                     break
                 except Exception as exc:
+                    self.failures += 1
+                    self.last_error = type(exc).__name__
                     self._fail(item, f"WeChat backend failed: {error_detail(exc)}")
                     item = None
                 finally:
@@ -141,4 +167,7 @@ class WeChatBackend:
     def status(self):
         return {"command": self.command, "available": Path(self.command).is_file(),
                 "process_active": self.active, "starts_this_session": self.starts,
-                "idle_shutdown_seconds": self.idle_seconds, "server_info": self.server_info}
+                "idle_shutdown_seconds": self.idle_seconds, "server_info": self.server_info,
+                "queue_depth": self.queue.qsize(), "queue_limit": self.queue.maxsize,
+                "completed": self.completed, "failures": self.failures,
+                "cancelled_active": self.cancelled, "last_error_type": self.last_error}

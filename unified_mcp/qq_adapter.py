@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from contextvars import ContextVar
 from pathlib import Path
@@ -186,13 +187,25 @@ def call(name, args):
         if _self_identity is None and name not in {"diagnose", "resolve_contact", "resolve_group"}:
             own = legacy.resolve_contacts(str(legacy.get_self_uin()), 10)
             _self_identity = require_unambiguous(own, str(legacy.get_self_uin()))
-        result = legacy.TOOL_HANDLERS[name](args)
+        from . import qq_paging
+        if name in {"messages", "chat_timeline", "search"}:
+            if name == "search" and not str(args.get("keyword") or "").strip():
+                raise ValueError("search requires keyword.")
+            effective = {"order": "desc", "display_order": "asc", "limit": 50, **args} if name == "chat_timeline" else args
+            result = qq_paging.messages(sys.modules[__name__], effective)
+        elif name in {"cache_recent", "stats", "export_messages", "recall_events"}:
+            result = getattr(qq_paging, name)(sys.modules[__name__], args)
+        else:
+            result = legacy.TOOL_HANDLERS[name](args)
         if name == "diagnose":
             result["per_database_keys_configured"] = bool(key_map()) if legacy.DEFAULT_DB_ROOT is not None else False
-        if isinstance(result, dict) and "messages" in result:
+        if isinstance(result, dict) and isinstance(result.get("messages"), list):
             if args.get("include_media", True):
                 from .qq_media import resolve_page_images
-                result["messages"] = resolve_page_images(result["messages"], legacy.DEFAULT_DATA_ROOT)
+                if legacy.DEFAULT_DATA_ROOT is not None:
+                    result["messages"] = resolve_page_images(result["messages"], legacy.DEFAULT_DATA_ROOT)
+                else:
+                    result.setdefault("warnings", []).append("QQ media directory is not configured; media hints are unverified.")
             result["freshness"] = {"message_source": "local_qq_database", "read_at": legacy.dt.datetime.now(legacy.LOCAL_TZ).isoformat()}
             result.setdefault("warnings", []).append("Only locally synchronized QQ records are available. images[].path is pixel-validated; media hints alone do not establish availability.")
         return result

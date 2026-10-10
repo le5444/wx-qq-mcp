@@ -1,14 +1,14 @@
 # 工具说明
 
-本文对应公开版 **0.2.1**。统一入口注册 **40 个 MCP 工具：25 个微信工具、10 个 QQ 工具、5 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
+本文对应版本 **0.3.0 Alpha**。统一入口注册 **44 个 MCP 工具：25 个微信工具、10 个 QQ 工具、9 个统一工具**。清单来自 `wechat_legacy_tools.json`、`qq_mcp_server.TOOLS` 和 `Gateway.tools()`；具体字段以客户端本次连接返回的 `tools/list` 为准。
 
 微信工具保留原名称，QQ 工具添加 `qq_` 前缀，跨平台能力使用 `unified_` 前缀。工具能够注册，不等于对应数据库、媒体、密钥和可选依赖都已就绪。
 
 ## 使用顺序
 
-1. 用 `unified_sources` 查看配置状态；需要 QQ 详情时用 `qq_diagnose`。微信侧状态只说明读取器文件与当前进程状态，仍需实际查询验证可用性。
+1. 用 `unified_health` 查看进程、队列和模型是否已初始化，它不打开数据库或加载模型；用 `unified_sources` 查看配置状态；需要 QQ 详情时用 `qq_diagnose`。微信侧状态只说明读取器文件与当前进程状态，仍需实际查询验证可用性。
 2. 用 `resolve_chat`、`qq_resolve_contact`、`qq_resolve_group` 或 `unified_resolve_chat` 找到候选会话，再使用稳定标识查询。相同昵称不会自动认定为同一人。
-3. 日常阅读使用 `chat_timeline`、`qq_chat_timeline` 或 `unified_timeline`；搜索使用相应搜索工具。
+3. 日常阅读使用 `chat_timeline`、`qq_chat_timeline` 或 `unified_timeline`；搜索命中后用 `unified_message` 精确定位、`unified_context` 展开前后文，群计数用 `unified_group_stats`。
 4. 有后续页时按返回的分页字段继续。检查 `warnings`、来源状态及媒体状态后，再判断覆盖范围。
 
 读取范围限本机已同步且可访问的数据。没有读取到某条记录或媒体，不能推出它从未存在。
@@ -58,36 +58,43 @@ QQ 读取通过本地 Python 适配层完成，必须先明确配置目标账号
 | `qq_diagnose` | 检查 QQ 路径、SQLCipher、扩展及密钥是否可用 | 不返回密钥正文；可能返回本地路径，已配置时会尝试打开资料库 |
 | `qq_resolve_contact` | 按备注、昵称、QQ 标识或 UID 查找私聊候选 | 必填 `query`，可选 `limit` |
 | `qq_resolve_group` | 按群名或群标识查找群候选 | 必填 `query`，可选 `limit` |
-| `qq_messages` | 读取一个会话的消息页 | 会话、时间、`keyword`、`limit`、`offset`、排序；`include_media` 控制媒体信息 |
+| `qq_messages` | 读取一个会话的消息页 | 会话、时间、`keyword`、`sender`、`kind_name`、`limit`、`cursor` / 兼容 `offset`、排序；`include_media` 控制媒体信息 |
 | `qq_chat_timeline` | 返回适合阅读的 QQ 时间线 | 会话、时间、关键词、分页和排序；默认取最近窗口，再按聊天顺序展示 |
 | `qq_search` | 在一个 QQ 会话内搜索 | 必填 `keyword`，同时指定会话；不是跨全部 QQ 会话搜索 |
 | `qq_cache_recent` | 将当前可读消息和可用媒体副本保存到本地缓存 | 会话、时间、关键词、`limit`、`order`、`include_media`；写缓存，不会自动持续监听 |
 | `qq_recall_events` | 查看撤回提示、附近上下文和缓存候选 | 会话、时间、`context_window`、`cache_window_seconds`；候选不应直接当作已确认的撤回原文 |
 | `qq_stats` | 统计一个会话的本地消息 | 可按时间、关键词筛选；按发送者、月份和类型汇总 |
-| `qq_export_messages` | 导出一个会话的消息 | 必填 `path`，同时指定会话；支持 `jsonl` / `markdown`；同路径文件会被覆盖 |
+| `qq_export_messages` | 导出一个会话的消息 | 必填 `path`，同时指定会话；支持 `jsonl` / `markdown`；默认拒绝已有文件；显式 `overwrite=true` 才允许覆盖，成功后原子发布 |
 
 网关给 `qq_messages`、`qq_chat_timeline` 增加 `include_image_text`。QQ 图片定位使用消息线索与本地缓存，并检验图片能否完整解码；路径无法确认或存在冲突时返回相应状态。QQ 语音、视频、文件和复杂消息目前不具备与微信一致的完整媒体处理能力，媒体线索也不代表已取得文件。
 
 撤回恢复只能利用原文仍在本地数据库中的情况，或先前 `qq_cache_recent` 已保存的内容；没有原文和历史缓存时，只能提供撤回提示及仍可读取的上下文。
 
-## 统一工具：5 项
+## 统一工具：9 项
 
 | 工具 | 用途 | 参数与返回重点 |
 | --- | --- | --- |
 | `unified_sources` | 查看两个来源的配置及当前运行状态 | 无参数；微信侧是读取器文件、是否活跃、会话内启动状态，QQ 侧执行诊断；不证明所有媒体或查询均正常 |
 | `unified_resolve_chat` | 同时查找微信和 QQ 候选 | 必填 `query`；`qq_chat_type=group` 查 QQ 群，否则查私聊联系人；不会按同名自动合并身份 |
-| `unified_timeline` | 按时间合并一个或两个平台的会话 | 至少提供 `wechat_chat` 或 `qq_chat`；支持时间、关键词、排序、`cursor`、媒体及 OCR 开关 |
+| `unified_timeline` | 按时间合并一个或两个平台的会话 | 至少提供 `wechat_chat` 或 `qq_chat`；支持 `date` 或起止时间、关键词、`sender`、`kind_name`、排序、`cursor`、媒体及 OCR 开关 |
 | `unified_search` | 在指定的一个或两个平台会话中搜索并合并 | 时间线参数加非空 `keyword`；不是全账号跨平台搜索 |
-| `unified_read_image` | 读取一个本地图片或表情的 OCR 与图片预览 | 必填 `path`；`include_image=false` 只返回 OCR 结果；动画预览只取首帧 |
+| `unified_read_image` | 读取一个本地图片或表情的 OCR 与图片预览 | 必填 `path`；`include_image=false` 不附图片块；OCR 不可用时可解码图片仍可预览，动画预览只取首帧 |
+| `unified_message` | 精确读取某条文字、语音、图片或表情消息 | 必填 `source`、`chat_id`，`record_id` / `message_id` 二选一；原生 ID 碰撞返回 `ambiguous`；可选日期、群聊类型、媒体开关及 `max_scan` |
+| `unified_context` | 展开某条记录前后文 | 精确定位参数，加 `before_count`、`after_count`，默认各 10 条、最多各 50 条；同秒消息仍按来源顺序保留 |
+| `unified_group_stats` | 群聊的事实计数 | 必填 `source`、稳定群 `chat_id`；支持日期或范围、`chat_type`、`max_messages`，按发送者 ID、类型和日期计数；不自动推断关系或情绪 |
+| `unified_health` | 无数据读取的快速健康检查 | 无参数；返回版本、PID、微信进程、QQ 队列和识别服务状态，不证明数据库、媒体或模型能成功读取 |
+
+`date=YYYY-MM-DD` 使用 +08:00 自然日，不能与 `after` / `before` 同传。精确定位与上下文默认 `max_scan=20000`，群统计默认 `max_messages=20000`，最多可显式设为 1000000；扫描触顶返回 `partial`，不能当作不存在或全量群统计。
 
 统一时间线每页 `limit` 为 1～500，默认 100。统一结果保留 `source`、`chat_id`、`message_id`、`record_id`、发送者、方向、时间、类型和 `original`。`record_id` 用于区分本地记录，不应仅按 `message_id` 删除看似重复的消息。
 
 ## 分页、失败与媒体状态
 
-- 原生时间线查看 `query.has_more` 和 `query.next_offset`；统一时间线使用 `has_more` 与 `next_cursor`。不能因为某一页为空或少于预期，就自行认定已经读完。
+- 微信原生时间线查看 `query.has_more` 和 `query.next_offset`；QQ 优先使用 `query.next_cursor`（不能同时传非零 offset），统一时间线使用 `has_more` 与 `next_cursor`。不能因为某一页为空或少于预期，就自行认定已经读完。
 - 统一游标绑定会话、时间、关键词、顺序与媒体选项。改变这些条件后应从头查询，不能复用原游标。
 - `snapshot_before` 固定的是首轮读取的时间上界，不是数据库事务快照。历史同步、迁移、删除或撤回可能改变旧记录及偏移，发生这些变化后应重新分页。
 - 任一请求的来源读取失败，统一时间线返回 `status=partial`、来源错误和已取得的 `available_source_pages`，主 `messages` 为空、游标不推进。先修复失败来源，或明确只查询可用来源；不能把它解释为“没有消息”。
+- QQ 分批查询不先加载整个范围，尚未证实终点时 `query.total=null`、`total_exact=false`。兼容的深层 offset 仍需从头跳过；完整统计调用 `qq_stats`，实现范围详见 [QQ_DATA.md](QQ_DATA.md)。
 - QQ 主消息库不可读会报错；QQ 全文检索辅助库不可读时可退回主库内容，并返回警告。这时文本覆盖可能降低。
 - `media_enrichment_failed` 等警告表示媒体补充处理失败，已取得的消息仍被保留。查看具体媒体状态，不要把查询成功等同于媒体完整。
 - OCR 的 `ok` / `no_text` 和语音的 `ok` / `no_speech` 都是自动结果。`no_text` 不证明图片没有文字，`no_speech` 不证明录音没有有效内容。`partial`、`unavailable`、`audio_missing`、`not_transcribed` 等状态应原样保留。

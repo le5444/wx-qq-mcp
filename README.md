@@ -2,21 +2,24 @@
 
 **把本机微信和 QQ 历史接入同一个 MCP 入口，并补充媒体校验、图片 OCR 和可选的本地语音识别。**
 
-这是一个面向 Windows x64 的源码集成项目，适用于 Codex、Claude Code 等支持 stdio MCP 的客户端。当前公开版为 **0.2.1（Alpha）**。它依赖已经可用的微信本地读取器，以及 QQ 的数据库扩展和本机账号数据；这些第三方程序、密钥和模型不包含在仓库里。
+这是一个面向 Windows x64 的源码集成项目，适用于 Codex、Claude Code 等支持 stdio MCP 的客户端。当前源码版本为 **0.3.0（Alpha）**。它依赖已经可用的微信本地读取器，以及 QQ 的数据库扩展和本机账号数据；这些第三方程序、密钥和模型不包含在仓库里。
 
 ## 能做什么
 
 | 能力 | 范围 |
 |---|---|
-| 一个入口读取两平台 | 25 个微信工具、10 个 `qq_*` 工具、5 个 `unified_*` 工具，共 40 个 |
-| 历史记录与检索 | 会话解析、消息时间线、关键词查询、发送者与来源标记、分页和导出 |
+| 一个入口读取两平台 | 25 个微信工具、10 个 `qq_*` 工具、9 个 `unified_*` 工具，共 44 个 |
+| 历史记录与检索 | 会话解析、按日期/类型/发送者读取、精确消息定位、上下文展开和分页导出 |
+| 群统计 | 按稳定发送者 ID、消息类型和日期计数，标明扫描上限及未完成范围 |
 | 两平台合并 | 保留各来源身份，按时间排序，用独立来源游标分页 |
 | 微信图片与表情 | 按消息资源或内容摘要定位，完整解码检查；部分 DAT 恢复为独立副本 |
 | QQ 图片 | 按消息文件名查找；对于 MD5 文件名，可在已知历史月份中精确匹配 |
 | 图片文字 | Windows 本地 OCR；长截图分片识别；`unified_read_image` 可返回真实图像预览 |
 | 微信语音 | 可选 SenseVoice / Whisper 本地识别、成功缓存、原音路径、自动识别标识 |
 | 微信视频 | 检查视频流与首帧，返回可用本地文件；可按需生成预览帧 |
-| 资源控制 | 微信读取子进程和语音工作进程按需启动、空闲退出；失败不会伪装成没有消息 |
+| 资源控制 | QQ 数据库分批分页、流式导出；工作进程按需启动、语音同任务合并与有限队列；快速健康检查 |
+| 共享后台 | 可选 `--shared` stdio 桥接同用户同配置的本地后台，跨客户端验收仍需按安装环境执行 |
+| 可恢复交付 | 一条命令串联快照、分阶段媒体处理、离线分片阅读页；可选便携媒体包 |
 
 继承的微信工具还包括群成员、群公告、朋友圈及互动、收藏、转账/红包记录、数据库结构和只读 SQL，具体取决于所接入微信读取器的兼容性。QQ 撤回记录只会引用本地已有缓存，不能恢复从未保存的原文。详细清单见 [工具说明](docs/TOOLS.md)。
 
@@ -81,7 +84,7 @@ QQ 数据库通常需要当前账号对应的密钥。本项目支持已有环�
 ```toml
 [mcp_servers.wx-mcp]
 command = 'C:/path/to/wx-qq-mcp/.venv/Scripts/python.exe'
-args = ['-m', 'unified_mcp.server']
+args = ['-X', 'utf8', '-m', 'unified_mcp.server']
 startup_timeout_sec = 30
 tool_timeout_sec = 300
 
@@ -90,6 +93,8 @@ UNIFIED_WECHAT_COMMAND = 'C:/path/to/wx-mcp.exe'
 QQ_MCP_DB_ROOT = 'C:/path/to/account/nt_qq/nt_db'
 QQ_MCP_EXTENSION = 'C:/path/to/sqlite_ext_ntqq_db.dll'
 ```
+
+可选共享模式在上述 `args` 末尾增加 `--shared`。同用户、同 Python/代码/配置的客户端通过本机回环地址连接同一份重后台；每个客户端保留轻量 stdio 桥。当前为 Alpha，首次使用应按 [安装说明](docs/SETUP.md) 和 [共享后台说明](docs/SHARED_SERVICE.md) 做双客户端连接及断开验证。
 
 先用 `unified_resolve_chat` 确认联系人候选，再把核实的稳定 ID 交给 `unified_timeline`。同名联系人不会被自动认作同一个人。更新程序后需重连 MCP，旧的 stdio 进程不会自动换成新代码。
 
@@ -106,6 +111,16 @@ QQ_MCP_EXTENSION = 'C:/path/to/sqlite_ext_ntqq_db.dll'
 
 ## 导出与本地阅读
 
+推荐总入口，可选择单微信、单 QQ、双平台或 QQ 群：
+
+```powershell
+python -X utf8 -m unified_mcp.workflow --wechat wxid_example --qq u_example `
+  --after 2026-10-01 --before 2026-10-02 --output C:/local-exports/job-example `
+  --transcribe --portable
+```
+
+中断后使用相同条件增加 `--resume`；需要重试失败媒体时再加 `--retry-failed`。`--transcribe` 明确启用已安装的本地 ASR。便携包可以整目录搬移，阅读页默认每 2000 条一片，搜索范围明确为当前分片。详见 [完整任务流程](docs/WORKFLOW.md)。原有独立入口仍保留：
+
 ```powershell
 .\.venv\Scripts\python.exe -m unified_mcp.export_snapshot `
   --wechat wxid_example --qq u_example --output C:/local-exports/example
@@ -114,16 +129,16 @@ wx-qq-reader --input C:/local-exports/example/merged.jsonl `
   --output C:/local-exports/example/reader.html --title '本地聊天阅读'
 ```
 
-消息快照会记录分页终点与范围。基础快照默认不批量识别微信媒体；`media_inventory` 和 `process_media` 提供显式的分批处理与断点续取。阅读页只使用输入文件里的媒体路径；没有实体的消息仍显示缺失状态，不会生成虚构图片或语音内容。
+消息快照以 SQLite 事务提交页和去重索引，恢复时复核已提交源页指纹，再重建 JSONL 投影。处理结果按阶段保存，模型变化可触发语音阶段重检；补下载媒体后可以仅重试失败阶段。基础导出禁用 OCR。阅读页只使用真实存在的本地路径，未找到的媒体仍保留缺失状态。
 
 ## 当前限制
 
 - 只能读取本机已经同步、可解密的数据。聊天记录存在，不代表对应媒体文件也存在。
 - 一部分微信图片 CDN 字段是协议票据，本项目没有实现该图片下载协议。表情的明确远程引用可通过独立脚本取回并校验。
-- QQ 并非所有消息类型和额外数据库均已验证；微信语音/视频能力不等同于 QQ 全媒体支持。
+- QQ 已保留已知 payload 文本与图片线索的有序片段，重复片段不丢；私有协议、回复和合并转发仍仅部分解析。微信语音/视频能力不等同于 QQ 全媒体支持。
 - 合并分页固定时间上界，但不是不可变数据库事务快照；历史迁移或删除期间可能需要重查。
-- QQ 大范围查询仍会加载匹配记录，数据库级 seek 分页尚未完成。
-- 多客户端共用磁盘缓存，**尚未共用一个后台进程**；同时连接可能增加常驻内存。
+- QQ 查询采用数据库批次和 keyset 游标，旧 offset 仍兼容；深层 offset、稀有关键词和统计仍可能扫描大量行，索引形状会影响耗时。QQ 消息缓存目前仍全量加载一个已缓存会话后合并。
+- 普通 stdio 模式仍每客户端启动一个网关。`--shared` 只有在用户、配置、代码和 Python 一致时才共用后台；不同配置会隔离。共享模式尚需多机器与长时间运行验证。
 - “图片可解码”“OCR 有文字”“视频首帧可解码”分别代表不同验证范围，不等于完整理解所有内容。
 - 当前为 Windows 源码发行版，不包含现成 EXE、一键获取第三方读取器或个人账号配置。
 
@@ -134,7 +149,7 @@ python -m unittest discover -s unified_mcp -p 'test_*.py' -v
 python scripts/check_release.py
 ```
 
-测试使用合成数据和独立临时目录。公开包不携带实际聊天记录、图片、转写、截图或个人验收报告。发布前另做无 QQ 账号配置的 MCP 握手，确认能加载工具目录并准确报告配置缺失。详见 [验证方法](docs/TESTING.md)。
+测试使用合成数据和独立临时目录。公开包不携带实际聊天记录、图片、转写、截图或个人验收报告。发布前另做无 QQ 账号配置的 MCP 握手，确认能加载工具目录并准确报告配置缺失。详见 [验证方法](docs/TESTING.md)、[用户请求场景](docs/SCENARIOS.md) 和 [QQ 数据层边界](docs/QQ_DATA.md)。
 
 ## 许可证与归属
 

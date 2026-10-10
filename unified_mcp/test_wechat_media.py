@@ -55,7 +55,9 @@ class WeChatMediaTests(unittest.TestCase):
         folder.mkdir(parents=True)
         path = folder / "arbitrary_name.png"
         path.write_bytes(png())
-        result = self.resolver.resolve(self.row)
+        # Newly booted Windows runners can have monotonic uptime below the TTL.
+        with patch("unified_mcp.wechat_media.time.monotonic", return_value=100):
+            result = self.resolver.resolve(self.row)
         self.assertEqual(result["status"], "readable")
         self.assertEqual(result["images"][0]["path"], str(path))
         self.assertTrue(result["images"][0]["xml_md5_matches"])
@@ -79,7 +81,8 @@ class WeChatMediaTests(unittest.TestCase):
         data = out.getvalue(); digest = hashlib.md5(data).hexdigest()
         (folder / (digest + ".gif")).write_bytes(data)
         row = {**self.row, "kind_name": "sticker", "message_content_parsed": {"md5": digest}}
-        result = self.resolver.resolve(row)
+        with patch("unified_mcp.wechat_media.time.monotonic", return_value=100):
+            result = self.resolver.resolve(row)
         self.assertEqual(result["images"][0]["media_validation"]["frames"], 2)
 
     def test_v4_direct_trailer_derivation_and_source_unchanged(self):
@@ -139,10 +142,42 @@ class WeChatMediaTests(unittest.TestCase):
         folder = self.account / "msg/attach" / hashlib.md5(b"wxid_friend").hexdigest() / "2023-11/Img"
         folder.mkdir(parents=True)
         (folder / ("a" * 32 + ".dat")).write_bytes(v4(png()))
-        result = self.resolver.enrich_payload(row, resource_rows=[resource])
+        with patch("unified_mcp.wechat_media.time.monotonic", return_value=100):
+            result = self.resolver.enrich_payload(row, resource_rows=[resource])
         self.assertEqual(result["wechat_media_resolution"]["status"], "readable")
         self.assertFalse(result["wechat_media_resolution"]["content_md5_available"])
         self.assertFalse(result["images"][0]["xml_md5_matches"])
+
+    def test_cold_uptime_caches_only_after_scanning_and_refreshes_at_ttl(self):
+        with patch("unified_mcp.wechat_media.time.monotonic", return_value=100) as clock, \
+             patch("unified_mcp.wechat_media._files", return_value=[]) as files:
+            self.resolver._index("wxid_friend")
+            first_scans = files.call_count
+            self.assertGreater(first_scans, 0)
+            self.assertEqual(self.resolver._global_indexed, 100)
+            self.assertEqual(self.resolver._indexed_chats["wxid_friend"], 100)
+            clock.return_value = 399
+            self.resolver._index("wxid_friend")
+            self.assertEqual(files.call_count, first_scans)
+            clock.return_value = 400
+            self.resolver._index("wxid_friend")
+            self.assertEqual(files.call_count, first_scans * 2)
+            self.assertEqual(self.resolver._global_indexed, 400)
+            self.assertEqual(self.resolver._indexed_chats["wxid_friend"], 400)
+
+    def test_zero_is_a_valid_cached_timestamp_and_new_chat_still_scans(self):
+        with patch("unified_mcp.wechat_media.time.monotonic", return_value=0) as clock, \
+             patch("unified_mcp.wechat_media._files", return_value=[]) as files:
+            self.resolver._index("wxid_friend")
+            first_scans = files.call_count
+            self.assertGreater(first_scans, 0)
+            self.resolver._index("wxid_friend")
+            self.assertEqual(files.call_count, first_scans)
+            clock.return_value = 100
+            self.resolver._index("wxid_another_friend")
+            self.assertGreater(files.call_count, first_scans)
+            self.assertEqual(self.resolver._global_indexed, 0)
+            self.assertEqual(self.resolver._indexed_chats["wxid_another_friend"], 100)
 
     def test_output_deduplicated_and_budget_enforced(self):
         from unified_mcp.media_validation import _decode_bytes

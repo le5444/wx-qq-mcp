@@ -16,12 +16,15 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from unified_mcp.runtime_paths import RUNTIME
+from unified_mcp.qq_cache_lock import cache_lock
+from unified_mcp.qq_segments import parse_segments
 
 try:
     import sqlcipher3
@@ -339,11 +342,10 @@ def collect_proto_text_fields(blob: Any, target_fields: set[int]) -> dict[int, l
 
 def extract_qq_payload_text(blob: Any) -> str | None:
     # QQNT text bodies have been observed in nested field 45101 when FTS is empty.
-    text_fields = collect_proto_text_fields(blob, {45101})
-    texts = text_fields.get(45101) or []
+    texts = [s["text"] for s in parse_segments(blob)["segments"] if s["type"] == "text"]
     if not texts:
         return None
-    return " / ".join(texts[:6])
+    return "\n".join(texts)
 
 
 def first_text_field(fields: dict[int, list[str]], field_no: int) -> str | None:
@@ -900,8 +902,10 @@ def build_records(
     contact: dict[str, Any],
     chat_type: str = "private",
     warnings: list[str] | None = None,
+    member_map: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    member_map = load_group_member_map(contact.get("group_id")) if chat_type == "group" else None
+    if member_map is None and chat_type == "group":
+        member_map = load_group_member_map(contact.get("group_id"))
     records: list[dict[str, Any]] = []
     for row in merge_main_and_fts_rows(main_rows, fts_rows):
         msg_id = int(row["msg_id"])
@@ -925,9 +929,6 @@ def build_records(
             text_source = "recall.prompt"
         hints = extract_blob_hints(row.get("payload"))
         ext_hints = extract_blob_hints(row.get("ext_payload"))
-        if not text and hints.get("text_hints"):
-            text = " / ".join(hints["text_hints"])
-            text_source = "payload.hints"
         if hints.get("images") and kind == "text":
             kind = "mixed/text-image"
         elif hints.get("images"):
@@ -948,6 +949,7 @@ def build_records(
             "chat_type": chat_type,
             "chat_id": chat_identity_value(contact, chat_type),
             "chat_name": chat_display_name(contact, chat_type),
+            **parse_segments(row.get("payload")),
         }
         if row.get("peer_num") is not None:
             record["peer_num"] = row.get("peer_num")
@@ -1001,8 +1003,14 @@ def filter_records(records: list[dict[str, Any]], args: dict[str, Any]) -> list[
     after_ts = parse_time_bound(args.get("after"))
     before_ts = parse_time_bound(args.get("before"), before=True)
     keyword = str(args.get("keyword") or "").strip().lower()
+    sender = str(args.get("sender") or "").strip()
+    kind = str(args.get("kind_name") or "").strip()
     result: list[dict[str, Any]] = []
     for rec in records:
+        if sender and sender not in {str(rec.get(k) or "") for k in ("sender", "sender_uid", "sender_uin", "direction")}:
+            continue
+        if kind and kind != str(rec.get("kind") or ""):
+            continue
         ts = rec.get("timestamp")
         if after_ts is not None and (ts is None or int(ts) < after_ts):
             continue
@@ -1200,6 +1208,12 @@ def cache_path_for_contact(contact: dict[str, Any]) -> Path:
 
 def load_cached_entries(contact: dict[str, Any]) -> list[dict[str, Any]]:
     path = cache_path_for_contact(contact)
+    with cache_lock(path.with_suffix(path.suffix + ".lock")):
+        return _load_cached_entries_unlocked(contact)
+
+
+def _load_cached_entries_unlocked(contact: dict[str, Any]) -> list[dict[str, Any]]:
+    path = cache_path_for_contact(contact)
     if not path.exists():
         return []
     entries: list[dict[str, Any]] = []
@@ -1210,26 +1224,47 @@ def load_cached_entries(contact: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             try:
                 entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"QQ cache is malformed; preserve and inspect {path.name} before retrying") from exc
             if isinstance(entry, dict) and isinstance(entry.get("record"), dict):
                 entries.append(entry)
+            else:
+                raise ValueError(f"QQ cache entry has an invalid shape; preserve and inspect {path.name} before retrying")
     return entries
 
 
 def write_cached_entries(contact: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
     path = cache_path_for_contact(contact)
+    with cache_lock(path.with_suffix(path.suffix + ".lock")):
+        return _write_cached_entries_unlocked(contact, entries)
+
+
+def _write_cached_entries_unlocked(contact: dict[str, Any], entries: list[dict[str, Any]]) -> Path:
+    path = cache_path_for_contact(contact)
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(entries, key=lambda entry: record_sort_key(entry.get("record") or {}))
-    with path.open("w", encoding="utf-8") as f:
-        for entry in ordered:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            for entry in ordered:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return path
 
 
 def merge_cached_records(contact: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+    path = cache_path_for_contact(contact)
+    with cache_lock(path.with_suffix(path.suffix + ".lock")):
+        return _merge_cached_records_unlocked(contact, records)
+
+
+def _merge_cached_records_unlocked(contact: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
     now = dt.datetime.now(LOCAL_TZ).isoformat(sep=" ", timespec="seconds")
-    existing = {str(entry.get("record", {}).get("msg_id")): entry for entry in load_cached_entries(contact)}
+    existing = {str(entry.get("record", {}).get("msg_id")): entry for entry in _load_cached_entries_unlocked(contact)}
     added = 0
     updated = 0
     preserved = 0
@@ -1258,7 +1293,7 @@ def merge_cached_records(contact: dict[str, Any], records: list[dict[str, Any]])
         if rec != prior_record:
             prior["record"] = rec
             updated += 1
-    path = write_cached_entries(contact, list(existing.values()))
+    path = _write_cached_entries_unlocked(contact, list(existing.values()))
     return {
         "cache_path": str(path),
         "cached_total": len(existing),
@@ -1404,201 +1439,45 @@ def tool_resolve_group(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_messages(args: dict[str, Any]) -> dict[str, Any]:
-    contact_query = chat_query_from_args(args)
-    if not contact_query:
-        raise ValueError("messages requires contact/chat/group.")
-    requested_type = chat_type_from_args(args)
-    contact, records, warnings = load_chat_records(contact_query, requested_type)
-    filtered = filter_records(records, args)
-    window, query = window_records(filtered, args, default_limit=50)
-    include_media = bool(args.get("include_media", True))
-    return {
-        "contact": contact,
-        "chat": contact,
-        "warnings": warnings,
-        "query": {
-            "contact": contact_query,
-            "chat_type": normalize_chat_type(contact.get("chat_type") or requested_type),
-            **query,
-            "after": args.get("after"),
-            "before": args.get("before"),
-            "keyword": args.get("keyword"),
-        },
-        "messages": strip_media_if_needed(window, include_media),
-    }
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("messages", args)
 
 
 def tool_chat_timeline(args: dict[str, Any]) -> dict[str, Any]:
-    merged = {"order": "desc", "display_order": "asc", "limit": 50, **args}
-    return tool_messages(merged)
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("chat_timeline", args)
 
 
 def tool_search(args: dict[str, Any]) -> dict[str, Any]:
-    keyword = str(args.get("keyword") or "").strip()
-    if not keyword:
-        raise ValueError("search requires keyword.")
-    merged = {"keyword": keyword, "order": args.get("order") or "desc", **args}
-    return tool_messages(merged)
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("search", args)
 
 
 def tool_cache_recent(args: dict[str, Any]) -> dict[str, Any]:
-    contact_query = chat_query_from_args(args)
-    if not contact_query:
-        raise ValueError("cache_recent requires contact/chat/group.")
-    requested_type = chat_type_from_args(args)
-    contact, records, warnings = load_chat_records(contact_query, requested_type)
-    filtered = filter_records(records, args)
-    order = str(args.get("order") or "desc").lower()
-    if order not in {"asc", "desc"}:
-        order = "desc"
-    limit = bounded_int(args.get("limit"), 500, 1, 10000)
-    ordered = sorted(filtered, key=record_sort_key, reverse=(order == "desc"))
-    selected = ordered[:limit]
-    cache_info = merge_cached_records(contact, selected)
-    include_media = bool(args.get("include_media", False))
-    return {
-        "contact": contact,
-        "chat": contact,
-        "warnings": warnings,
-        "query": {
-            "contact": contact_query,
-            "chat_type": normalize_chat_type(contact.get("chat_type") or requested_type),
-            "order": order,
-            "limit": limit,
-            "after": args.get("after"),
-            "before": args.get("before"),
-            "keyword": args.get("keyword"),
-        },
-        "cache": cache_info,
-        "messages": strip_media_if_needed(selected, include_media),
-    }
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("cache_recent", args)
 
 
 def tool_recall_events(args: dict[str, Any]) -> dict[str, Any]:
-    contact_query = chat_query_from_args(args)
-    if not contact_query:
-        raise ValueError("recall_events requires contact/chat/group.")
-    requested_type = chat_type_from_args(args)
-    contact, records, warnings = load_chat_records(contact_query, requested_type)
-    filtered = filter_records(records, args)
-    ordered = sorted(filtered, key=record_sort_key)
-    recall_records = [rec for rec in ordered if is_recall_record(rec)]
-    limit = bounded_int(args.get("limit"), 20, 1, 200)
-    order = str(args.get("order") or "desc").lower()
-    if order not in {"asc", "desc"}:
-        order = "desc"
-    context_window = bounded_int(args.get("context_window"), 3, 0, 20)
-    cache_window_seconds = bounded_int(args.get("cache_window_seconds"), 3600, 0, 86400)
-    include_media = bool(args.get("include_media", False))
-    live_ids = {str(rec.get("msg_id") or "") for rec in records if rec.get("msg_id") is not None}
-    events: list[dict[str, Any]] = []
-    selected_events = sorted(recall_records, key=record_sort_key, reverse=(order == "desc"))[:limit]
-    for event in selected_events:
-        try:
-            index = ordered.index(event)
-        except ValueError:
-            continue
-        before = ordered[max(0, index - context_window) : index]
-        after = ordered[index + 1 : index + 1 + context_window]
-        cached = find_cached_recall_candidates(
-            contact,
-            event,
-            live_ids,
-            window_seconds=cache_window_seconds,
-            limit=5,
-        )
-        events.append(
-            {
-                "event": strip_media_if_needed([event], include_media)[0],
-                "context": {
-                    "before": strip_media_if_needed(before, include_media),
-                    "after": strip_media_if_needed(after, include_media),
-                },
-                "cache_lookup": cached,
-            }
-        )
-    return {
-        "contact": contact,
-        "chat": contact,
-        "warnings": warnings,
-        "query": {
-            "contact": contact_query,
-            "chat_type": normalize_chat_type(contact.get("chat_type") or requested_type),
-            "after": args.get("after"),
-            "before": args.get("before"),
-            "limit": limit,
-            "order": order,
-            "context_window": context_window,
-            "cache_window_seconds": cache_window_seconds,
-        },
-        "returned": len(events),
-        "events": events,
-        "limitation": "Only messages present in the local QQNT DB or previously captured by cache_recent can be recovered. If QQ already removed the original and no cache exists, only the recall prompt and context are available.",
-    }
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("recall_events", args)
 
 
 def tool_stats(args: dict[str, Any]) -> dict[str, Any]:
-    contact_query = chat_query_from_args(args)
-    if not contact_query:
-        raise ValueError("stats requires contact/chat/group.")
-    requested_type = chat_type_from_args(args)
-    contact, records, warnings = load_chat_records(contact_query, requested_type)
-    filtered = filter_records(records, args)
-    return {**summarize_records(filtered, contact), "warnings": warnings}
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("stats", args)
 
 
 def tool_export_messages(args: dict[str, Any]) -> dict[str, Any]:
-    contact_query = chat_query_from_args(args)
-    if not contact_query:
-        raise ValueError("export_messages requires contact/chat/group.")
-    output = str(args.get("path") or "").strip()
-    if not output:
-        raise ValueError("export_messages requires path.")
-    fmt = str(args.get("format") or "jsonl").lower()
-    if fmt not in {"jsonl", "markdown"}:
-        raise ValueError("format must be jsonl or markdown.")
-    requested_type = chat_type_from_args(args)
-    contact, records, warnings = load_chat_records(contact_query, requested_type)
-    filtered = filter_records(records, args)
-    if args.get("limit") not in (None, ""):
-        limit = bounded_int(args.get("limit"), len(filtered), 1, 1_000_000)
-        filtered = filtered[:limit]
-    out_path = Path(output).expanduser()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if fmt == "jsonl":
-        with out_path.open("w", encoding="utf-8") as f:
-            for rec in filtered:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    else:
-        with out_path.open("w", encoding="utf-8") as f:
-            f.write(f"# QQ 聊天导出: {chat_display_name(contact, normalize_chat_type(contact.get('chat_type') or requested_type))}\n\n")
-            f.write(f"- 聊天类型: `{normalize_chat_type(contact.get('chat_type') or requested_type)}`\n")
-            f.write(f"- 聊天 ID: `{chat_identity_value(contact, normalize_chat_type(contact.get('chat_type') or requested_type))}`\n")
-            if contact.get("uid") or contact.get("uin"):
-                f.write(f"- 联系人 UID/QQ: `{contact.get('uid')}` / `{contact.get('uin')}`\n")
-            if contact.get("nick") or contact.get("remark"):
-                f.write(f"- 昵称/备注: `{contact.get('nick')}` / `{contact.get('remark')}`\n")
-            f.write(f"- 消息数: {len(filtered)}\n")
-            if filtered:
-                f.write(f"- 时间跨度: {filtered[0].get('time')} 到 {filtered[-1].get('time')}\n")
-            f.write("\n")
-            current_day = None
-            for rec in filtered:
-                day = str(rec.get("time") or "")[:10]
-                if day and day != current_day:
-                    current_day = day
-                    f.write(f"\n## {day}\n\n")
-                body = rec.get("text") or f"[{rec.get('kind')}]"
-                media = rec.get("media") or {}
-                details = []
-                if media.get("images"):
-                    details.append("图片: " + ", ".join(media["images"][:3]))
-                if media.get("files"):
-                    details.append("文件: " + ", ".join(media["files"][:3]))
-                if details:
-                    body += " (" + "; ".join(details) + ")"
-                f.write(f"- {str(rec.get('time') or '')[11:19]} {rec.get('sender')}: {body}\n")
-    return {"path": str(out_path), "format": fmt, "messages": len(filtered), "warnings": warnings, **summarize_records(filtered, contact)}
+    # Standalone QQ and the unified gateway share one bounded implementation.
+    from unified_mcp import qq_adapter
+    return qq_adapter.call("export_messages", args)
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -1763,6 +1642,8 @@ TOOLS: list[dict[str, Any]] = [
                 "group": {"type": "string"},
                 "chat_type": {"type": "string", "enum": ["private", "group", "discuss"], "default": "private"},
                 "path": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False,
+                              "description": "Explicitly allow replacing an existing export; otherwise refuse."},
                 "format": {"type": "string", "enum": ["jsonl", "markdown"], "default": "jsonl"},
                 "after": {"type": "string"},
                 "before": {"type": "string"},
@@ -1774,6 +1655,18 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+# The same schemas are visible before the first data call in standalone mode.
+for _tool in TOOLS:
+    if _tool["name"] in {"messages", "chat_timeline", "search"}:
+        _tool["inputSchema"]["properties"]["cursor"] = {
+            "type": "string", "description": "Opaque query.next_cursor from the previous page; do not combine with nonzero offset."}
+    if _tool["name"] in {"messages", "chat_timeline", "search", "stats", "export_messages", "cache_recent", "recall_events"}:
+        _tool["inputSchema"]["properties"]["sender"] = {
+            "type": "string", "description": "Exact sender UID, QQ number, display name, or direction."}
+        _tool["inputSchema"]["properties"]["kind_name"] = {
+            "type": "string", "description": "Exact normalized kind (text, image, mixed/text-image, recall/system, reply/quote, etc.)."}
+
 
 TOOL_HANDLERS = {
     "diagnose": tool_diagnose,
