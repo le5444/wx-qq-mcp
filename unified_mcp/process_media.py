@@ -21,8 +21,37 @@ from unified_mcp import voice_transcription as voice_module
 from unified_mcp.wechat_media import enrich_wechat_media
 from unified_mcp.video_media import enrich_wechat_video
 from unified_mcp.qq_media import resolve_message_images
+from unified_mcp.enrichment_updates import merge_update
+from unified_mcp.message_identity import IdentityError, compatible_identity, identity_complete, message_identity
 
 STAGES = ('media', 'voice', 'video', 'ocr')
+
+
+def bound_original(row):
+    """Carry verified outer context into the original before media association."""
+    identity = message_identity(row)
+    raw = copy.deepcopy(row.get('original') or {})
+    if identity['source'] and raw.get('source') not in ('wechat', 'qq'):
+        # Preserve provenance such as fts_only; source can be carried separately
+        # by the caller, while chat/time/native identity are required below.
+        if not raw.get('source'):
+            raw['source'] = identity['source']
+    fields = {'chat_id': identity['chat_id'], 'timestamp': identity['timestamp']}
+    if identity['source'] == 'wechat':
+        fields.update(talker=identity['chat_id'], create_time=identity['timestamp'])
+        native = raw.setdefault('id', {})
+        if not isinstance(native, dict):
+            raise IdentityError('Native WeChat identity must be an object')
+        for key, value in (('server_id_str', identity['message_id']), ('local_id', identity['local_id'])):
+            if value is not None:
+                native.setdefault(key, value if key == 'server_id_str' else int(value))
+    elif identity['source'] == 'qq' and identity['message_id'] is not None:
+        raw.setdefault('msg_id', identity['message_id'])
+    for key, value in fields.items():
+        if value is not None:
+            raw.setdefault(key, int(value) if key in ('timestamp', 'create_time') else value)
+    message_identity(raw)
+    return raw
 
 
 class LocalMetadata:
@@ -31,7 +60,8 @@ class LocalMetadata:
         self.gateway = None
 
     async def load(self, row, include_paths=False):
-        original = row.get('original') or {}
+        expected = message_identity(row)
+        original = bound_original(row)
         identity = original.get('id') if isinstance(original.get('id'), dict) else original
         talker = row.get('chat_id') or original.get('talker') or identity.get('talker')
         server = identity.get('server_id_str') or original.get('server_id_str')
@@ -73,6 +103,9 @@ class LocalMetadata:
                                       'limit': 1000, 'include_media_paths': include_paths})
         exact = []
         for candidate in rows:
+            candidate_identity = message_identity(candidate)
+            if not compatible_identity(expected, candidate_identity):
+                continue
             native = candidate.get('id') if isinstance(candidate.get('id'), dict) else candidate
             if local_id is not None and str(native.get('local_id')) != str(local_id):
                 continue
@@ -80,11 +113,19 @@ class LocalMetadata:
                 continue
             if candidate.get('create_time') is not None and candidate['create_time'] != timestamp:
                 continue
-            exact.append(candidate)
+            exact.append(bound_original({**row, 'original': candidate}))
         # Multiple exact matches may be shard collisions; never guess an audio.
         if len(exact) > 1:
             raise ValueError('Ambiguous local message identity; media was not assigned')
-        return exact, resources
+        scoped_resources = []
+        for resource in resources:
+            resource_identity = message_identity(resource)
+            if not compatible_identity(expected, resource_identity):
+                continue
+            # The exact resource query is bound to this source record. Preserve
+            # native claims and add only missing fields from the query scope.
+            scoped_resources.append(bound_original({**row, 'original': resource}))
+        return exact, scoped_resources
 
     async def close(self):
         if self.gateway is not None:
@@ -172,6 +213,7 @@ def _iter_source(snapshot, source):
             row = json.loads(line)
             if not isinstance(row, dict) or row.get('source') != source or not row.get('record_id'):
                 raise ValueError(f'Invalid normalized record in {source} line {number}')
+            message_identity(row)
             yield row
 
 
@@ -211,6 +253,45 @@ def _project(db, result_file):
     return project_jsonl(result_file, (row[0] for row in db.execute('SELECT payload FROM work ORDER BY seq')))
 
 
+def _import_qq_updates(db, path):
+    counts = {'imported': 0, 'skipped_unscoped': 0, 'applied': 0}
+    if not path:
+        return counts
+    with Path(path).open(encoding='utf-8-sig') as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            identity = message_identity(item)
+            if identity['source'] not in (None, 'qq'):
+                raise IdentityError('External QQ enrichment contains a different platform')
+            exact = identity['source'] == 'qq' and isinstance(item.get('record_id'), str) and bool(item['record_id'])
+            if not exact and not identity_complete(identity):
+                counts['skipped_unscoped'] += 1
+                continue
+            db.execute('INSERT OR IGNORE INTO qq_updates_scoped(record_id,msg_id,chat_id,payload) VALUES(?,?,?,?)',
+                       (item.get('record_id') if exact else None, identity['message_id'], identity['chat_id'], canonical(item)))
+            counts['imported'] += 1
+    return counts
+
+
+def _apply_qq_update(db, row):
+    identity = message_identity(row)
+    matches = db.execute('SELECT payload FROM qq_updates_scoped WHERE record_id=?', (row['record_id'],)).fetchall()
+    exact = bool(matches)
+    if not matches and identity_complete(identity):
+        matches = db.execute('SELECT payload FROM qq_updates_scoped WHERE record_id IS NULL AND chat_id=? AND msg_id=?',
+                             (identity['chat_id'], identity['message_id'])).fetchall()
+        # Legacy raw media files can contain several same-ID messages from
+        # different instants; only the fully matching identity is eligible.
+        matches = [item for item in matches if compatible_identity(identity, message_identity(json.loads(item[0])), require_complete=True)]
+    if len(matches) > 1:
+        raise IdentityError('Ambiguous external QQ enrichment for one message')
+    if not matches:
+        return row, False
+    return merge_update(row, json.loads(matches[0][0]), raw_qq=not exact), True
+
+
 async def run(snapshot, output, qq_enriched=None, limit=None, resume=False, *,
               transcribe=False, retry_failed=False, refresh=False, stages=None, qq_data_root=None):
     snapshot, output = Path(snapshot).resolve(), Path(output).resolve()
@@ -246,7 +327,7 @@ async def _run_locked(snapshot, output, qq_enriched, limit, resume, transcribe, 
                         for name, state in coverage.get('sources', {}).items()}})}
     if qq_enriched:
         files['qq_enriched'] = file_fingerprint(qq_enriched)
-    scope = {'snapshot': str(snapshot), 'files': files, 'sources': sources}
+    scope = {'snapshot': str(snapshot), 'files': files, 'sources': sources, 'association_version': 2}
     versions = _stage_versions(transcribe, qq_data_root)
     db = open_store(checkpoint)
     voices, reader, metadata = None, None, LocalMetadata()
@@ -263,8 +344,9 @@ async def _run_locked(snapshot, output, qq_enriched, limit, resume, transcribe, 
                 UNIQUE(source,record_id));
             CREATE TABLE IF NOT EXISTS stages(source TEXT,record_id TEXT,name TEXT,version TEXT,status TEXT,
                 PRIMARY KEY(source,record_id,name));
-            CREATE TABLE IF NOT EXISTS qq_updates(record_id TEXT PRIMARY KEY,msg_id TEXT,payload TEXT);
-            CREATE INDEX IF NOT EXISTS qq_native_id ON qq_updates(msg_id);
+            CREATE TABLE IF NOT EXISTS qq_updates_scoped(seq INTEGER PRIMARY KEY,record_id TEXT,msg_id TEXT,chat_id TEXT,payload TEXT UNIQUE);
+            CREATE INDEX IF NOT EXISTS qq_update_record ON qq_updates_scoped(record_id);
+            CREATE INDEX IF NOT EXISTS qq_update_chat_native ON qq_updates_scoped(chat_id,msg_id);
         ''')
         saved = db.execute("SELECT value FROM meta WHERE key='scope'").fetchone()
         if saved and json.loads(saved[0]) != scope:
@@ -272,15 +354,10 @@ async def _run_locked(snapshot, output, qq_enriched, limit, resume, transcribe, 
         if not saved:
             with db:
                 db.execute("INSERT INTO meta VALUES('scope',?)", (canonical(scope),))
-                if qq_enriched:
-                    with Path(qq_enriched).open(encoding='utf-8-sig') as stream:
-                        for number, line in enumerate(stream):
-                            if not line.strip():
-                                continue
-                            item = json.loads(line)
-                            raw = item.get('original', item)
-                            db.execute('INSERT INTO qq_updates VALUES(?,?,?)',
-                                       (item.get('record_id', f'legacy:{number}'), str(raw.get('msg_id', item.get('message_id', ''))), canonical(raw)))
+                update_counts = _import_qq_updates(db, qq_enriched)
+                db.execute("INSERT INTO meta VALUES('qq_update_counts',?)", (canonical(update_counts),))
+        stored_counts = db.execute("SELECT value FROM meta WHERE key='qq_update_counts'").fetchone()
+        report['qq_enrichment'] = json.loads(stored_counts[0]) if stored_counts else {'imported': 0, 'skipped_unscoped': 0, 'applied': 0}
         verified = True
         voices, reader = VoiceService(), ImageTextReader()
         handled = 0
@@ -294,13 +371,8 @@ async def _run_locked(snapshot, output, qq_enriched, limit, resume, transcribe, 
                 did_work = not existing
                 row.setdefault('original', {})
                 if source == 'qq' and not existing:
-                    update = db.execute('SELECT payload FROM qq_updates WHERE record_id=?', (row['record_id'],)).fetchone()
-                    if update is None:
-                        matches = db.execute('SELECT payload FROM qq_updates WHERE msg_id=? LIMIT 2', (str(row.get('message_id', '')),)).fetchall()
-                        # Legacy native IDs may collide; do not guess which row.
-                        update = matches[0] if len(matches) == 1 else None
-                    if update:
-                        row['original'] = json.loads(update[0])
+                    row, applied = _apply_qq_update(db, row)
+                    report['qq_enrichment']['applied'] += int(applied)
                 for stage in stages:
                     if not _applicable(stage, row):
                         continue
@@ -311,6 +383,7 @@ async def _run_locked(snapshot, output, qq_enriched, limit, resume, transcribe, 
                     did_work = True
                     status = 'failed'
                     try:
+                        row['original'] = bound_original(row)
                         if stage == 'media':
                             if source == 'wechat':
                                 row['original'] = await asyncio.to_thread(enrich_wechat_media, row['original'])

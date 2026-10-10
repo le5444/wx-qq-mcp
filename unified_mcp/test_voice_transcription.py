@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -94,23 +95,28 @@ class VoiceTests(unittest.TestCase):
     def test_exact_server_id_and_ambiguity(self):
         directory = self.root / "media/account"
         directory.mkdir(parents=True)
-        correct = directory / ("voice-" + "a"*32 + "-12-12345-678-3000-abcd.silk")
-        wrong = directory / ("voice-" + "a"*32 + "-678-12345-567-3000-abcd.silk")
+        talker = "synthetic-chat"
+        chat_hash = hashlib.md5(talker.encode()).hexdigest()
+        correct = directory / ("voice-" + chat_hash + "-12-12345-678-3000-abcd.silk")
+        wrong = directory / ("voice-" + chat_hash + "-678-12345-567-3000-abcd.silk")
         correct.write_bytes(b"audio")
         wrong.write_bytes(b"different")
-        self.assertEqual(audio_path_from_message({"server_id_str": "678"}, self.root/"media"), correct)
-        duplicate = directory / ("voice-" + "a"*32 + "-13-12346-678-3000-abcd.silk")
-        duplicate.write_bytes(b"different")
+        identity = {"talker": talker, "server_id_str": "678", "local_id": 12, "create_time": 12345}
         self.assertIsNone(audio_path_from_message({"server_id_str": "678"}, self.root/"media"))
+        self.assertEqual(audio_path_from_message(identity, self.root/"media"), correct)
+        duplicate = directory / ("voice-" + chat_hash + "-12-12345-678-3000-other.silk")
+        duplicate.write_bytes(b"different")
+        self.assertIsNone(audio_path_from_message(identity, self.root/"media"))
 
     def test_same_audio_in_old_and_new_cache_filenames_resolves(self):
         directory = self.root / "media/account"
         directory.mkdir(parents=True)
-        paths = [directory / ("voice-" + "a"*32 + "-12-12345-678-" + suffix + ".silk")
+        talker = "synthetic-chat"
+        paths = [directory / ("voice-" + hashlib.md5(talker.encode()).hexdigest() + "-12-12345-678-" + suffix + ".silk")
                  for suffix in ("3000-abcd", "abcd")]
         for path in paths:
             path.write_bytes(b"same audio")
-        self.assertIn(audio_path_from_message({"server_id_str": "678", "local_id": 12, "create_time": 12345}, self.root/"media"), paths)
+        self.assertIn(audio_path_from_message({"talker": talker, "server_id_str": "678", "local_id": 12, "create_time": 12345}, self.root/"media"), paths)
         self.assertIsNone(audio_path_from_message({"server_id_str": "678", "local_id": 13}, self.root/"media"))
 
     def test_existing_beam5_success_reused_by_greedy(self):

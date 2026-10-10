@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 
 from unified_mcp.media_validation import _decode_bytes, _read_local_image, validate_image_path, IMAGE_EXTENSIONS
 from unified_mcp.runtime_paths import RUNTIME
+from unified_mcp.message_identity import message_identity, identity_complete, compatible_identity, IdentityError
 
 BASE = Path(__file__).resolve().parent
 HEX = re.compile(r"^[a-fA-F0-9]{32}$")
@@ -32,14 +33,11 @@ V4 = (b"\x07\x08V1\x08\x07", b"\x07\x08V2\x08\x07")
 
 
 def _identity(row):
-    if isinstance(row.get("original"), dict):
-        return _identity(row["original"])
-    ident = row.get("id") if isinstance(row.get("id"), dict) else {}
-    server = next((v for v in (row.get("server_id_str"), row.get("message_id"), ident.get("server_id_str"), row.get("server_id")) if v is not None and v != ""), 0)
-    return (str(row.get("talker") or ident.get("talker") or row.get("chat_id") or ""),
-            str(server),
-            str(row.get("local_id") or ident.get("local_id") or ""),
-            str(row.get("create_time") or row.get("timestamp") or ""))
+    ident = message_identity(row)
+    if not identity_complete(ident):
+        raise IdentityError("Media identity requires chat, time and a native record ID")
+    return (ident['chat_id'], ident['message_id'] or '0',
+            ident['local_id'] if ident['local_id'] is not None else '', ident['timestamp'])
 
 
 def _parsed(row):
@@ -102,6 +100,7 @@ class WeChatMediaResolver:
         self._keys = list(dict.fromkeys(self._keys))
         self._xor = set()
         self._metadata = {}
+        self._metadata_conflicts = set()
         self._resources = defaultdict(list)
         self._metadata_mtime = {}
         self._plaintext = defaultdict(list)
@@ -136,12 +135,15 @@ class WeChatMediaResolver:
                         row = json.loads(line)
                     except ValueError:
                         continue  # A writer may still be appending the last line.
-                    if name == "image_resources.jsonl":
+                    try:
                         key = _identity(row)
+                    except IdentityError:
+                        continue  # Unscoped rows must not contaminate shared indexes.
+                    if name == "image_resources.jsonl":
                         if row not in self._resources[key]:
                             self._resources[key].append(row)
                     else:
-                        self._metadata[_identity(row)] = row
+                        self._store_metadata(key, row)
             self._metadata_mtime[name] = stamp
 
     def _index_plain(self, path):
@@ -345,8 +347,17 @@ class WeChatMediaResolver:
             return self._resolve(row)
 
     def _resolve(self, row):
-        identity = _identity(row)
-        original = self._metadata.get(identity, row)
+        try:
+            identity = _identity(row)
+        except IdentityError as exc:
+            return {"status": "identity_unavailable", "images": [], "reason": str(exc), "network_used": False}
+        if identity in self._metadata_conflicts:
+            return {"status": "identity_ambiguous", "images": [], "network_used": False}
+        original = self._metadata.get(identity, row.get('original', row))
+        requested_md5 = str(_parsed(row.get('original', row)).get('md5', '')).lower()
+        stored_md5 = str(_parsed(original).get('md5', '')).lower()
+        if HEX.fullmatch(requested_md5) and HEX.fullmatch(stored_md5) and requested_md5 != stored_md5:
+            return {"status": "identity_ambiguous", "images": [], "network_used": False}
         kind = original.get("kind_name") or original.get("kind") or row.get("kind")
         if kind not in ("image", "sticker", "emoji"):
             return {"status": "not_applicable", "images": []}
@@ -358,7 +369,16 @@ class WeChatMediaResolver:
         has_storage_md5 = any(HEX.fullmatch(str(resource.get("md5", ""))) for resource in linked_resources)
         if not HEX.fullmatch(md5):
             existing = []
+            identity_rejected = False
             for item in row.get("images", []) or []:
+                if isinstance(item, dict):
+                    try:
+                        compatible = compatible_identity(message_identity(row), message_identity(item))
+                    except IdentityError:
+                        compatible = False
+                    if not compatible:
+                        identity_rejected = True
+                        continue
                 value = item.get("path") if isinstance(item, dict) else item
                 if not isinstance(value, str) or not value or "://" in value or value.startswith(("\\\\", "//")):
                     continue
@@ -371,6 +391,8 @@ class WeChatMediaResolver:
             if existing:
                 return {"status": "readable", "images": existing, "kind": kind,
                         "metadata_status": "missing", "network_used": False}
+            if identity_rejected:
+                return {"status": "identity_unavailable", "images": [], "reason": "foreign_image_resource_identity", "network_used": False}
             if kind != "image" or not has_storage_md5:
                 return {"status": "metadata_missing", "images": [], "kind": kind}
             # Some genuine image messages contain an empty XML md5. The exact
@@ -446,13 +468,29 @@ class WeChatMediaResolver:
                 "only_thumbnail": bool(refs) and all(ref.get("variant") == "thumbnail" for ref in refs),
                 "local_candidates": len(candidates), "failures": dict(failures), "network_used": False}
 
+    def _store_metadata(self, key, row):
+        previous = self._metadata.get(key)
+        if previous is not None:
+            old_md5 = str(_parsed(previous).get('md5', '')).lower()
+            new_md5 = str(_parsed(row).get('md5', '')).lower()
+            if HEX.fullmatch(old_md5) and HEX.fullmatch(new_md5) and old_md5 != new_md5:
+                self._metadata_conflicts.add(key)
+                return
+        self._metadata[key] = row
+
     def enrich_payload(self, payload, metadata_rows=None, resource_rows=None):
         with self._lock:
             self.load_metadata()
             for row in metadata_rows or []:
-                self._metadata[_identity(row)] = row
+                try:
+                    self._store_metadata(_identity(row), row)
+                except IdentityError:
+                    continue
             for row in resource_rows or []:
-                key = _identity(row)
+                try:
+                    key = _identity(row)
+                except IdentityError:
+                    continue
                 if row not in self._resources[key]:
                     self._resources[key].append(row)
             def walk(value):
@@ -467,6 +505,8 @@ class WeChatMediaResolver:
                     out["wechat_media_resolution"] = {k: v for k, v in resolution.items() if k != "images"}
                     if resolution["images"]:
                         out["images"] = resolution["images"]
+                    elif resolution['status'] in {'identity_unavailable', 'identity_ambiguous'}:
+                        out.pop('images', None)
                     return out
                 return {k: walk(v) for k, v in value.items()}
             return walk(payload)

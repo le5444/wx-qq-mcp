@@ -28,6 +28,8 @@ from unified_mcp.voice_transcription import VoiceService
 from unified_mcp.image_text import ImageTextReader, image_reference_rank
 from unified_mcp.version import VERSION
 from unified_mcp import analysis_tools
+from unified_mcp.read_contract import validate_record_chat
+from unified_mcp.message_identity import message_identity
 
 BASE = Path(__file__).resolve().parent
 INSTRUCTIONS = "wx-mcp exposes BOTH WeChat and QQ. Original unprefixed tools are WeChat; qq_* tools are QQ; unified_* read both. Resolve stable chat identities before reading. Never infer senders or equate matching nicknames. Page until has_more is false. Use unified_message/context for exact records and unified_group_stats for factual counts. Report partial scans, unavailable media and unsynchronized history explicitly. No message-sending tools are provided."
@@ -63,6 +65,18 @@ class Gateway:
         include_image_text = args.pop("include_image_text", True)
         if source == "wechat":
             result = await self.wechat.call(name, args)
+            if result.isError and args.get("talker"):
+                raise RuntimeError("WeChat reader failed; unverified response content was withheld")
+            if not result.isError and args.get("talker"):
+                for block in result.content:
+                    if block.type == "text":
+                        try:
+                            data = json.loads(block.text)
+                        except (ValueError, TypeError):
+                            continue
+                        self._check_wechat_scope(data, args["talker"])
+                if result.structuredContent is not None:
+                    self._check_wechat_scope(result.structuredContent, args["talker"])
             if (result.isError or args.get("include_media_paths") is False or args.get("include_images") is False
                     or (name == "media_resources" and args.get("include_local_paths") is False)):
                 return result
@@ -139,11 +153,33 @@ class Gateway:
         return found
 
     @staticmethod
-    def _json_result(result):
+    def _check_wechat_scope(payload, talker):
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            rows = payload.get("messages", payload.get("resources", []))
+            if not rows and any(key in payload for key in ("id", "talker", "chat_id", "create_time")):
+                rows = [payload]
+        else:
+            return payload
+        if not isinstance(rows, list):
+            return payload
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Source returned an invalid message record")
+            validate_record_chat("wechat", row, str(talker))
+            identity = message_identity(row)
+            if identity["chat_id"] and identity["chat_id"] != str(talker):
+                raise ValueError("Source returned a record from another chat")
+        return payload
+
+    @staticmethod
+    def _json_result(result, talker=None):
         if result.isError:
             raise RuntimeError("Media metadata query failed")
         text = [block.text for block in result.content if block.type == "text"]
-        return json.loads(text[0]) if len(text) == 1 else None
+        payload = json.loads(text[0]) if len(text) == 1 else None
+        return Gateway._check_wechat_scope(payload, talker) if talker else payload
 
     async def _enrich_wechat(self, payload, name, args):
         nodes = self._media_nodes(payload)
@@ -160,14 +196,14 @@ class Gateway:
                                "base_kind", "limit", "offset", "order", "display_order", "sender"}
                     query = {k: v for k, v in args.items() if k in allowed}
                     query.update(fields="full", include_media_paths=False)
-                    metadata = self._json_result(await self.wechat.call("messages", query))
+                    metadata = self._json_result(await self.wechat.call("messages", query), args.get("talker"))
                     resources = []
                     times = [row.get("create_time") for row in unresolved if row.get("create_time") is not None]
                     if times:
                         resource_query = {k: args[k] for k in ("talker", "chat") if k in args}
                         resource_query.update(after=str(min(times)), before=str(max(times)+1),
                                               limit=5000, include_local_paths=False, include_debug=True)
-                        resources = self._json_result(await self.wechat.call("media_resources", resource_query))
+                        resources = self._json_result(await self.wechat.call("media_resources", resource_query), args.get("talker"))
                     payload = await asyncio.to_thread(enrich_wechat_media, payload,
                                                        metadata if isinstance(metadata, list) else [],
                                                        resources if isinstance(resources, list) else [])
@@ -198,7 +234,7 @@ class Gateway:
                             query["server_id_str"] = str(server_id)
                         if local_id is not None:
                             query["local_id"] = int(local_id)
-                        data = self._json_result(await self.wechat.call("media_resources", query))
+                        data = self._json_result(await self.wechat.call("media_resources", query), talker)
                         if isinstance(data, list):
                             resources.extend(data)
                     payload = await asyncio.to_thread(enrich_wechat_video, payload, resources)
@@ -259,6 +295,8 @@ class Gateway:
             "after": {"type": "string"}, "before": {"type": "string"}, "keyword": {"type": "string"},
             "date": {"type": "string", "description": "YYYY-MM-DD in +08:00; cannot be combined with after/before"},
             "sender": {"type": "string"}, "kind_name": {"type": "string"},
+            "wechat_sender": {"type": "string", "description": "WeChat sender ID; use separate platform sender fields for a two-platform query"},
+            "qq_sender": {"type": "string", "description": "QQ sender selector, e.g. uid:u_example or uin:12345; names must use name: prefix when numeric"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
             "order": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
             "cursor": {"type": "string"}, "include_media": {"type": "boolean", "default": True},

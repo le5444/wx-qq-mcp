@@ -1,8 +1,9 @@
 """Resolve QQ image hints for a selected message page without changing files.
 
-Exact payload filenames are tried in the message/current month first. MD5
-filenames can additionally use historical Pic month folders, since migrated
-files may have a different cache month. Only month directory names are listed;
+Ordinary payload filenames are limited to the message month. Hash-shaped
+filenames may use current or historical Pic folders, but conflicting bytes in
+one variant are rejected before selecting any month. A thumbnail is not required
+to have the original image's byte digest. Only month directory names are listed;
 there is no recursive scan, download, wildcard filename match, or source write.
 """
 
@@ -112,15 +113,19 @@ def _historical_image(hint: str, bases: list[Path], root: Path, cache: dict) -> 
                 before = actual.stat()
                 decoded = _decoded_image(actual, cache)
                 if decoded["status"] == "available":
-                    hasher = hashlib.sha256()
-                    with actual.open("rb") as source:
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            hasher.update(chunk)
-                    digest = hasher.hexdigest()
+                    hash_key = ('sha256', str(actual), before.st_size, before.st_mtime_ns)
+                    digest = cache.get(hash_key)
+                    if digest is None:
+                        hasher = hashlib.sha256()
+                        with actual.open("rb") as source:
+                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                hasher.update(chunk)
+                        digest = hasher.hexdigest()
                     after = actual.stat()
                     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                         last_failure = "changed_during_read"
                         continue
+                    cache[hash_key] = digest
                     available.append({**decoded, "sha256": digest, "cache_month": base.name})
                 else:
                     last_failure = decoded["status"]
@@ -145,57 +150,42 @@ def _resolve(message: dict[str, Any], root: Path, current: dt.datetime, cache: d
         hints = [hints]
     if not isinstance(hints, (list, tuple)):
         hints = []
-    months = list(dict.fromkeys(filter(None, (_message_month(message), current.strftime("%Y-%m")))))
-    bases = [root / "Pic" / month for month in months] + [root / "Pic"]
-    other_bases = [base for base in historical_bases if base not in bases]
-    searched_months = list(months)
+    message_month = _message_month(message)
+    months = list(dict.fromkeys(filter(None, (message_month, current.strftime("%Y-%m")))))
+    primary_bases = [root / "Pic" / month for month in months] + [root / "Pic"]
+    all_bases = list(dict.fromkeys([*primary_bases, *historical_bases]))
+    searched_months = []
     items = []
-    seen_hints = set()
-    for hint in hints:
-        # Filename-only lookups prevent path traversal and wildcard matches.
+    resolved_hints = {}
+    for occurrence, hint in enumerate(hints):
         if not isinstance(hint, str) or not IMAGE_NAME.fullmatch(hint) or ".." in hint:
-            items.append({"status": "invalid_hint"})
+            items.append({"status": "invalid_hint", "occurrence": occurrence})
             continue
-        if hint.lower() in seen_hints:
-            continue
-        seen_hints.add(hint.lower())
-        item: dict[str, Any] = {"hint": hint, "status": "not_found"}
-        matched = 0
-        for family in FAMILIES:
-            if item["status"] == "available":
-                break
-            for base in bases:
-                candidate = base / family / hint
-                try:
-                    if not candidate.is_file():
-                        continue
-                    actual = candidate.resolve(strict=True)
-                    if not actual.is_relative_to(root):
-                        item["status"] = "outside_data_root"
-                        continue
-                except (OSError, RuntimeError):
-                    continue
-                matched += 1
-                decoded = _decoded_image(actual, cache)
-                if decoded["status"] != "available":
-                    item["status"] = decoded["status"]
-                    continue
-                result["images"].append({**decoded, "hint": hint, "source": "qq_local_cache",
-                                         "variant": "thumbnail" if family.startswith("Thumb") else "original"})
-                item["status"] = "available"
-                break
-        if item["status"] != "available" and HASH_IMAGE_NAME.fullmatch(hint):
-            extra = _historical_image(hint, other_bases, root, cache)
-            searched_months.extend(base.name for base in other_bases if base.name not in searched_months)
-            matched += extra.pop("matched_files")
-            if extra["status"] == "available":
-                result["images"].append({**extra, "hint": hint, "source": "qq_local_cache"})
-                item.update(status="available", lookup_scope=extra["lookup_scope"], cache_month=extra["cache_month"])
-            elif extra["status"] == "ambiguous_cache_files":
-                item["status"] = extra["status"]
-            elif item["status"] == "not_found" and extra["status"] != "not_found":
-                item["status"] = extra["status"]
-        item["matched_files"] = matched
+        hashed = bool(HASH_IMAGE_NAME.fullmatch(hint))
+        # An ordinary basename is not a cross-month identity. Keep it strictly
+        # within the message month. Hash-shaped names may have migrated, but
+        # every matching file in the same variant must agree on its bytes.
+        bases = all_bases if hashed else [root / "Pic" / message_month] if message_month else []
+        for base in bases:
+            if MONTH_NAME.fullmatch(base.name) and base.name not in searched_months:
+                searched_months.append(base.name)
+        cache_key = (hint.lower(), tuple(str(base) for base in bases))
+        if cache_key not in resolved_hints:
+            resolved_hints[cache_key] = _historical_image(hint, bases, root, cache)
+        found = dict(resolved_hints[cache_key])
+        item = {"hint": hint, "status": found['status'], "occurrence": occurrence,
+                "matched_files": found.get('matched_files', 0)}
+        if found['status'] == 'available':
+            candidate = Path(found['path'])
+            origin = candidate.parent.parent
+            scope = 'message_month_exact_filename' if message_month and origin.name == message_month else (
+                'current_or_common_exact_hash' if origin in primary_bases else 'historical_month_exact_hash')
+            reference = {**found, "hint": hint, "source": "qq_local_cache", "lookup_scope": scope,
+                         "media_occurrence": occurrence,
+                         "identity_evidence": "exact_filename_consistent_within_variant",
+                         "content_hash_matches_filename_verified": False}
+            result['images'].append(reference)
+            item.update(lookup_scope=scope, cache_month=found.get('cache_month'))
         items.append(item)
     available = len(result["images"])
     status = "no_image_hints" if not items else "ok" if available == len(items) else "partial" if available else "unavailable"
@@ -209,7 +199,7 @@ def resolve_page_images(messages: list[dict[str, Any]], data_root: str | Path,
 
     Call this only after filtering/pagination. Original ``media.images`` hints
     remain unchanged. A per-call cache avoids decoding a shared image twice.
-    ``images`` contains at most one successfully decoded file per unique hint.
+    Repeated hints retain their occurrence order; file validation is cached.
     """
     root = Path(data_root).expanduser().resolve()
     current = now or dt.datetime.now(LOCAL_TZ)

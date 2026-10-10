@@ -9,6 +9,8 @@ import tempfile
 from urllib.parse import quote
 
 from unified_mcp.batch_support import atomic_json, canonical, file_fingerprint, open_store, output_lock
+from unified_mcp.enrichment_updates import merge_update
+from unified_mcp.message_identity import message_identity
 
 
 def local_file(value):
@@ -36,6 +38,9 @@ def load_rows(path):
             row = json.loads(line)
             if not isinstance(row, dict) or 'source' not in row or 'record_id' not in row:
                 raise ValueError(f'Line {index} is not a normalized source/record_id message')
+            if row['source'] not in ('wechat', 'qq') or not isinstance(row['record_id'], str) or not row['record_id']:
+                raise ValueError(f'Line {index} has an invalid source/record_id')
+            message_identity(row)  # Reject contradictions between outer/native IDs.
             yield row
 
 
@@ -138,11 +143,19 @@ def build(input_path, output_path, title='微信与 QQ · 本地聊天阅读', u
             folder = Path(temporary)
             db = open_store(folder / 'build.sqlite3')
             db.execute('CREATE TABLE updates(source TEXT,record_id TEXT,payload TEXT,PRIMARY KEY(source,record_id))')
-            if updates:
-                with db:
-                    for row in load_rows(updates):
-                        db.execute('INSERT INTO updates VALUES(?,?,?) ON CONFLICT(source,record_id) DO UPDATE SET payload=excluded.payload',
-                                   (row['source'], row['record_id'], canonical(row)))
+            try:
+                if updates:
+                    with db:
+                        for row in load_rows(updates):
+                            encoded = canonical(row)
+                            prior = db.execute('SELECT payload FROM updates WHERE source=? AND record_id=?',
+                                               (row['source'], row['record_id'])).fetchone()
+                            if prior and prior[0] != encoded:
+                                raise ValueError('Conflicting duplicate media updates for one source/record_id')
+                            db.execute('INSERT OR IGNORE INTO updates VALUES(?,?,?)', (row['source'], row['record_id'], encoded))
+            except BaseException:
+                db.close()
+                raise
             assets = Assets(folder, output_path.stem, db, portable)
             total, displayed, items, parts = 0, 0, [], []
             part_dir = folder / (output_path.stem + '.pages')
@@ -163,7 +176,7 @@ def build(input_path, output_path, title='微信与 QQ · 本地聊天阅读', u
                 for incoming in load_rows(input_path):
                     total += 1
                     replacement = db.execute('SELECT payload FROM updates WHERE source=? AND record_id=?', (incoming['source'], incoming['record_id'])).fetchone()
-                    row = json.loads(replacement[0]) if replacement else incoming
+                    row = merge_update(incoming, json.loads(replacement[0])) if replacement else incoming
                     item = _item(row, assets)
                     if media_only and item['category'] == 'text':
                         continue

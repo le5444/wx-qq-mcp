@@ -478,7 +478,7 @@ class WholeWorkflowTests(unittest.IsolatedAsyncioTestCase):
         resolver = media.LocalMetadata()
         resolver.gateway = SimpleNamespace(wechat=SimpleNamespace(call=call))
         row = normalized(2, kind='voice')
-        row.update(chat_id='synthetic-chat', timestamp=12)
+        row.update(chat_id='synthetic-chat', timestamp=12, message_id='42')
         row['original']['id']['server_id_str'] = '42'
         exact, resources = await resolver.load(row, include_paths=True)
         self.assertEqual(len(exact), 1)

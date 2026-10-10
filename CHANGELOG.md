@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 — Identity and coverage hardening
+
+- Require exact QQ UID/UIN and owner-profile matches, reject conflicting selectors, and scope self-chat reads to the actual conversation. Unknown or contradictory sender identities remain unassigned.
+- Bind verified QQ numeric-account aliases to canonical UIDs. Native QQ statistics use stable identity keys instead of names; sender filters separate identity namespaces.
+- Validate bounded pages before exposing any records. Rejected source pages no longer carry foreign chat text in diagnostic output; source-degradation warnings cannot become complete absence or complete group statistics.
+- Limit voice resolution to current-message resources and exact cache identity; preserve outer chat scope, reject contradictory media metadata and same-variant QQ cache collisions.
+- Validate external enrichment against immutable message identity and merge only derived fields. Exported collision record IDs can be used for exact lookup and context without selecting the first ambiguous record.
+- Compatibility changes: native QQ `by_sender` uses `uid:`/`uin:` keys with display names supplied separately. Dual-platform sender queries use `wechat_sender` and `qq_sender`. Incomplete media identities and fuzzy stable-ID lookups are rejected rather than guessed.
+
 ## 0.3.0 — Alpha workflow and resource improvements
 
 - Expand to 44 tools with exact record lookup, scoped context, factual group statistics and a lightweight health check. Add explicit local-day, sender and type filters.

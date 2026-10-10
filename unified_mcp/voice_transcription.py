@@ -25,8 +25,10 @@ import wave
 
 try:
     from unified_mcp.runtime_paths import RUNTIME
+    from unified_mcp.message_identity import message_identity, compatible_identity, IdentityError
 except ModuleNotFoundError:  # Dedicated ASR venv executes this worker as a file.
     from runtime_paths import RUNTIME
+    from message_identity import message_identity, compatible_identity, IdentityError
 
 ROOT = Path(__file__).resolve().parent
 STATE_HOME = RUNTIME
@@ -359,58 +361,114 @@ def is_voice(node: dict) -> bool:
             or isinstance(node.get("voice"), dict))
 
 
-def audio_path_from_message(node: dict, media_cache: Path = MEDIA_CACHE) -> Path | None:
-    """Resolve audio solely from explicit paths or exact server-id cache names."""
-    candidates = []
-    def visit(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"path", "local_path", "audio_path", "decoded_path"} and isinstance(child, str):
-                    candidates.append(child)
-                elif key in {"local_paths", "direct_readable_local_paths", "decoded_local_paths"} and isinstance(child, list):
-                    candidates.extend(c for c in child if isinstance(c, str))
-                elif isinstance(child, (dict, list)):
-                    visit(child)
-        elif isinstance(value, list):
+def resolve_audio_from_message(node: dict, media_cache: Path = MEDIA_CACHE) -> dict:
+    """Read only current-message audio fields; cache fallback needs full identity."""
+    try:
+        expected = message_identity(node)
+    except IdentityError as exc:
+        return {"status": "identity_unavailable", "reason": str(exc)}
+    # Deliberate allowlist: quoted_message, reply, forwarded messages and any
+    # other message-bearing subtree cannot supply the parent's audio.
+    containers = {"original", "voice", "audio", "audios", "voice_transcript", "transcript",
+                  "media", "media_resources", "resources", "media_read_hints", "local_path_details",
+                  "local_media_metadata", "local_media_resources"}
+    path_keys = {"path", "local_path", "audio_path", "decoded_path", "decoded_audio_path"}
+    list_keys = {"local_paths", "direct_readable_local_paths", "decoded_local_paths"}
+    candidates, conflicts = [], []
+
+    def visit(value, rank=0, parent_key="", depth=0):
+        if depth > 12:
+            return
+        if isinstance(value, list):
             for child in value:
-                visit(child)
+                visit(child, rank, parent_key, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        try:
+            identity = message_identity(value)
+        except IdentityError:
+            conflicts.append("conflicting_resource_identity")
+            return
+        if not compatible_identity(expected, identity):
+            conflicts.append("foreign_resource_identity")
+            return
+        if parent_key in {"local_media_metadata", "local_media_resources"} and not compatible_identity(expected, identity, require_complete=True):
+            conflicts.append("unscoped_resource_identity")
+            return
+        for key, child in value.items():
+            if key in path_keys and isinstance(child, str):
+                candidates.append((rank, child))
+            elif key in list_keys and isinstance(child, list):
+                candidates.extend((rank, path) for path in child if isinstance(path, str))
+            elif key in containers:
+                extra = 0 if key == "original" else 1 if key in {"voice", "audio", "audios"} else 2
+                visit(child, rank + extra, key, depth + 1)
+
     visit(node)
-    for candidate in candidates:
-        if candidate.startswith(("\\\\", "//")) or "://" in candidate:
+    valid = []
+    for rank, value in candidates:
+        if value.startswith(("\\\\", "//")) or "://" in value:
             continue
-        path = Path(candidate)
-        if path.suffix.lower() in {".silk", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".amr", ".opus", ".aac"} and path.is_file():
-            return path
-    ids = [node.get("server_id_str"), node.get("voice_server_id_str"), node.get("server_id"), node.get("message_id"), node.get("id", {}).get("server_id_str") if isinstance(node.get("id"), dict) else None]
-    original = node.get("original")
-    if isinstance(original, dict):
-        identity = original.get("id", {})
-        if isinstance(identity, dict):
-            ids.append(identity.get("server_id_str"))
-    row = original if isinstance(original, dict) else node
-    identity = row.get("id") if isinstance(row.get("id"), dict) else row
-    local_id = identity.get("local_id", row.get("voice_local_id"))
-    talker = identity.get("talker", row.get("talker"))
-    created = row.get("create_time", row.get("voice_create_time", node.get("timestamp")))
-    for identifier in ids:
-        if identifier and str(identifier).lstrip("-").isdigit() and int(identifier) != 0:
-            matches = [p for p in media_cache.glob(f"*/voice-*-{identifier}-*.silk")
-                       if (match := SILK_NAME.match(p.name)) and match.group("server") == str(identifier)
-                       and (local_id is None or match.group("local") == str(local_id))
-                       and (created is None or match.group("time") == str(created))
-                       and (not talker or match.group("talker") == hashlib.md5(str(talker).encode()).hexdigest())]
-            if len(matches) == 1:
-                return matches[0]
-            if len(matches) > 1:
-                # Go versions include or omit duration in otherwise identical
-                # names. Identical bytes are the same audio, not an ambiguity.
-                try:
-                    hashes = {hashlib.sha256(read_audio(p)).digest() for p in matches}
-                except (OSError, ValueError):
-                    continue
-                if len(hashes) == 1:
-                    return min(matches, key=lambda p: len(str(p)))
-    return None
+        path = Path(value)
+        if path.suffix.lower() not in {".silk", ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".amr", ".opus", ".aac"} or not path.is_file():
+            continue
+        named = SILK_NAME.match(path.name)
+        if named:
+            required = (expected.get("chat_id"), expected.get("message_id"), expected.get("local_id"), expected.get("timestamp"))
+            if any(item is None for item in required):
+                conflicts.append("cache_identity_incomplete")
+                continue
+            if (named.group("talker") != hashlib.md5(expected['chat_id'].encode()).hexdigest()
+                    or named.group("server") != expected['message_id'] or named.group("local") != expected['local_id']
+                    or named.group("time") != expected['timestamp']):
+                conflicts.append("cache_identity_mismatch")
+                continue
+        valid.append((rank, path))
+    if valid:
+        rank = min(value[0] for value in valid)
+        preferred = list(dict.fromkeys(path for priority, path in valid if priority == rank))
+        # A converted WAV and its SILK source can legitimately have different
+        # bytes. Prefer decoded PCM for the current message, but refuse multiple
+        # differing candidates of that format rather than choosing by order.
+        for suffix in ('.wav', '.flac', '.silk', '.mp3', '.ogg', '.m4a', '.amr', '.opus', '.aac'):
+            chosen = [path for path in preferred if path.suffix.lower() == suffix]
+            if not chosen:
+                continue
+            try:
+                hashes = {hashlib.sha256(read_audio(path)).digest() for path in chosen}
+            except (OSError, ValueError):
+                return {"status": "audio_missing", "reason": "explicit_audio_unreadable"}
+            if len(hashes) != 1:
+                return {"status": "identity_ambiguous", "reason": "multiple_current_audio_files"}
+            return {"status": "ok", "path": min(chosen, key=lambda path: len(str(path))), "provenance": "current_message_audio"}
+    # Explicit paths can stand on their own, but scanning a shared cache cannot.
+    if any(expected.get(key) is None for key in ('chat_id', 'message_id', 'local_id', 'timestamp')):
+        return {"status": "identity_unavailable", "reason": "cache_lookup_requires_chat_and_native_ids_and_time"}
+    matches = []
+    for path in media_cache.glob(f"*/voice-*-{expected['message_id']}-*.silk"):
+        name = SILK_NAME.match(path.name)
+        if not name or (name.group('talker') != hashlib.md5(expected['chat_id'].encode()).hexdigest()
+                or name.group('server') != expected['message_id'] or name.group('local') != expected['local_id']
+                or name.group('time') != expected['timestamp']):
+            continue
+        if expected.get('account_id') and path.parent.name != expected['account_id']:
+            continue
+        matches.append(path)
+    if matches:
+        try:
+            hashes = {hashlib.sha256(read_audio(path)).digest() for path in matches}
+        except (OSError, ValueError):
+            return {"status": "audio_missing", "reason": "matched_audio_unreadable"}
+        if len(hashes) == 1:
+            return {"status": "ok", "path": min(matches, key=lambda path: len(str(path))), "provenance": "exact_message_cache_identity"}
+        return {"status": "identity_ambiguous", "reason": "conflicting_exact_audio_cache_files"}
+    return {"status": "audio_missing", "reason": conflicts[0] if conflicts else "no_matching_local_audio"}
+
+
+def audio_path_from_message(node: dict, media_cache: Path = MEDIA_CACHE) -> Path | None:
+    """Compatibility path-only API; detailed reasons are exposed by VoiceService."""
+    return resolve_audio_from_message(node, media_cache).get('path')
 
 
 def attach_transcript(node: dict, transcript: dict) -> dict:
@@ -644,10 +702,12 @@ when its final waiter leaves, or when the owning service explicitly closes.
         if not isinstance(payload, dict):
             return payload
         if is_voice(payload):
-            path = await asyncio.to_thread(audio_path_from_message, payload)
+            resolution = await asyncio.to_thread(resolve_audio_from_message, payload)
+            path = resolution.get("path")
             if path is None:
                 return attach_transcript(payload, {"status": "audio_missing", "retryable": True,
-                                                   "automatic": True, "engine": "faster-whisper-local"})
+                    "resolution_status": resolution["status"], "reason": resolution.get("reason"),
+                    "automatic": True, "engine": "faster-whisper-local"})
             transcript = await self.transcribe(path) if transcribe else await asyncio.to_thread(cached_transcript, path)
             return attach_transcript(payload, transcript or {"status": "not_transcribed", "retryable": True})
         return {key: await self.enrich(value, transcribe) for key, value in payload.items()}
